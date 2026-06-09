@@ -113,6 +113,13 @@ Valores de som por plataforma:
 - **Linux** — nome de evento do tema freedesktop (ex.: `message-new-instant`, `complete`, `bell`, `dialog-warning`).
 - **Windows** — nome de som do sistema (`Asterisk`, `Beep`, `Exclamation`, `Hand`, `Question`).
 
+Exemplos (macOS/Linux):
+
+```bash
+INTERVAL=120 ./claude-limit-watch.sh           # checa a cada 2 minutos
+DROP_THRESHOLD=10 ./claude-limit-watch.sh once # só alerta se o uso cair >10%
+```
+
 ### Onde colocar as credenciais
 
 O script carrega as variáveis automaticamente, nesta ordem (a primeira que existir já vale):
@@ -121,13 +128,6 @@ O script carrega as variáveis automaticamente, nesta ordem (a primeira que exis
 2. `.env` na pasta do script
 
 Para o Telegram, aceita tanto `TG_TOKEN`/`TG_CHAT_ID` quanto `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`.
-
-Exemplos:
-
-```bash
-INTERVAL=120 ./claude-limit-watch.sh           # checa a cada 2 minutos
-DROP_THRESHOLD=10 ./claude-limit-watch.sh once # só alerta se o uso cair >10%
-```
 
 ## Notificações no Telegram (opcional)
 
@@ -151,6 +151,66 @@ DROP_THRESHOLD=10 ./claude-limit-watch.sh once # só alerta se o uso cair >10%
    > script **já está no `.gitignore`** — não comite suas credenciais.
 
    O chat_id aceita usuário, **grupo** (número negativo), canal (`@canal`) e vários valores separados por vírgula: `123,-100456,@canal`.
+
+## Rodar automaticamente (na inicialização)
+
+Para o watcher subir junto com o sistema e reiniciar sozinho:
+
+### macOS — launchd
+
+Crie `~/Library/LaunchAgents/com.claude.limitwatch.plist` (ajuste o caminho do script):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>            <string>com.claude.limitwatch</string>
+  <key>ProgramArguments</key> <array>
+    <string>/caminho/para/claude-limit-watch.sh</string>
+  </array>
+  <key>RunAtLoad</key>        <true/>
+  <key>KeepAlive</key>        <true/>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.claude.limitwatch.plist
+```
+
+### Linux — systemd (user service)
+
+Crie `~/.config/systemd/user/claude-limit-watch.service`:
+
+```ini
+[Unit]
+Description=Claude Code limit watcher
+
+[Service]
+ExecStart=/caminho/para/claude-limit-watch-linux.sh
+Restart=always
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now claude-limit-watch.service
+journalctl --user -u claude-limit-watch -f   # acompanhar
+```
+
+### Windows — Agendador de Tarefas
+
+Crie uma tarefa que roda ao logon, em segundo plano:
+
+```powershell
+$action  = New-ScheduledTaskAction -Execute 'powershell.exe' `
+  -Argument '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\caminho\para\claude-limit-watch.ps1"'
+$trigger = New-ScheduledTaskTrigger -AtLogOn
+Register-ScheduledTask -TaskName 'ClaudeLimitWatch' -Action $action -Trigger $trigger
+```
 
 ## Estado e log
 
