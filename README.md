@@ -20,16 +20,33 @@ Para cada janela (5h e semanal), dispara uma notificação quando:
 1. **O horário de reset avança** para um novo valor → começou uma nova janela; ou
 2. **O % de uso cai** além de `DROP_THRESHOLD` → a cota liberou antes do previsto.
 
-Em ambos os casos você recebe: **notificação no macOS** + **som** (distinto por janela) + **mensagem no Telegram** (se configurado).
+Em ambos os casos você recebe: **notificação no desktop** + **som** (distinto por janela) + **mensagem no Telegram** (se configurado).
+
+## Versões por plataforma
+
+Há um script por sistema operacional, todos com os mesmos modos e a mesma configuração — muda só a forma de notificar:
+
+| Sistema | Script | Notificação | Som |
+|---------|--------|-------------|-----|
+| macOS   | [`claude-limit-watch.sh`](claude-limit-watch.sh)       | `osascript` | `afplay` (sons de `/System/Library/Sounds`) |
+| Linux   | [`claude-limit-watch-linux.sh`](claude-limit-watch-linux.sh) | `notify-send` | `canberra-gtk-play` / `paplay` / `aplay` |
+| Windows | [`claude-limit-watch.ps1`](claude-limit-watch.ps1)     | Toast (Win10+) com fallback p/ balão | `System.Media.SystemSounds` |
 
 ## Pré-requisitos
 
+Comuns a todos:
+
 - **Claude Code CLI** (`claude`) autenticado na sua assinatura.
-- **macOS** para as notificações nativas (`osascript`) e o som (`afplay`). Em outros sistemas o script roda, mas só registra no log / Telegram.
-- `jq` (opcional, recomendado) para parse mais robusto da saída. Sem ele, há um fallback com `sed`.
-- `curl` (opcional) — apenas para as notificações via Telegram.
+
+Por plataforma:
+
+- **macOS** — `osascript` e `afplay` (nativos). `jq` (opcional, parse mais robusto), `curl` (opcional, Telegram).
+- **Linux** — `notify-send` (pacote `libnotify-bin`) e, para som, `canberra-gtk-play` (`libcanberra-gtk-module`), `paplay` ou `aplay`. `jq` e `curl` opcionais como acima.
+- **Windows** — **PowerShell 5+** (ou PowerShell 7). Notificações e Telegram são nativos (não precisa de `curl`/`jq`).
 
 ## Uso
+
+### macOS
 
 ```bash
 chmod +x claude-limit-watch.sh
@@ -46,6 +63,34 @@ nohup ./claude-limit-watch.sh > /dev/null 2>&1 &
 tail -f ~/.claude/limit-watch/watch.log
 ```
 
+### Linux
+
+```bash
+chmod +x claude-limit-watch-linux.sh
+
+./claude-limit-watch-linux.sh          # watch
+./claude-limit-watch-linux.sh once
+./claude-limit-watch-linux.sh getid
+
+# em background:
+nohup ./claude-limit-watch-linux.sh > /dev/null 2>&1 &
+tail -f ~/.claude/limit-watch/watch.log
+```
+
+### Windows (PowerShell)
+
+```powershell
+# se a execução de scripts estiver bloqueada, libere só para esta sessão:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+.\claude-limit-watch.ps1            # watch
+.\claude-limit-watch.ps1 once
+.\claude-limit-watch.ps1 getid
+
+# variáveis de ambiente são definidas com $env: antes de chamar:
+$env:INTERVAL = 120; .\claude-limit-watch.ps1
+```
+
 ## Configuração
 
 Tudo é controlado por variáveis de ambiente (com valores padrão):
@@ -55,14 +100,18 @@ Tudo é controlado por variáveis de ambiente (com valores padrão):
 | `INTERVAL`       | `60`                        | Intervalo entre checagens, em segundos (modo `watch`). |
 | `MODEL`          | `haiku`                     | Modelo usado na chamada `/usage`. |
 | `DROP_THRESHOLD` | `5`                         | Queda mínima de % para considerar que a cota liberou. |
-| `SOUND_5H`       | `Ping`                      | Som da notificação da janela de 5h. |
-| `SOUND_WEEK`     | `Submarine`                 | Som da notificação da janela semanal. |
+| `SOUND_5H`       | macOS `Ping` · Linux `message-new-instant` · Win `Asterisk` | Som da notificação da janela de 5h. |
+| `SOUND_WEEK`     | macOS `Submarine` · Linux `complete` · Win `Exclamation`    | Som da notificação da janela semanal. |
 | `STATE_DIR`      | `~/.claude/limit-watch`     | Onde ficam o log e o estado das janelas. |
 | `TG_ENV_FILE`    | `$STATE_DIR/telegram.env`   | Arquivo carregado automaticamente com as credenciais do Telegram. |
 | `TG_TOKEN`       | —                           | Token do bot (do `@BotFather`). Alias: `TELEGRAM_BOT_TOKEN`. |
 | `TG_CHAT_ID`     | —                           | Um ou mais chat_ids separados por vírgula. Alias: `TELEGRAM_CHAT_ID`. |
 
-Os sons disponíveis estão em `/System/Library/Sounds` (ex.: `Glass`, `Ping`, `Submarine`, `Hero`, `Sosumi`).
+Valores de som por plataforma:
+
+- **macOS** — nome de arquivo em `/System/Library/Sounds` (ex.: `Glass`, `Ping`, `Submarine`, `Hero`, `Sosumi`).
+- **Linux** — nome de evento do tema freedesktop (ex.: `message-new-instant`, `complete`, `bell`, `dialog-warning`).
+- **Windows** — nome de som do sistema (`Asterisk`, `Beep`, `Exclamation`, `Hand`, `Question`).
 
 ### Onde colocar as credenciais
 
