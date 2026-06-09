@@ -31,7 +31,7 @@
 set -uo pipefail
 
 # ---------- configuração ----------
-INTERVAL="${INTERVAL:-60}"
+INTERVAL="${INTERVAL:-300}"  # 5 minutos
 MODEL="${MODEL:-haiku}"
 DROP_THRESHOLD="${DROP_THRESHOLD:-5}"  # queda mínima de % p/ considerar que a cota liberou
 # Eventos do tema de som freedesktop (usados por canberra-gtk-play -i <evento>).
@@ -98,15 +98,34 @@ notify() { # título, mensagem, som(evento, opcional)
   tg_send "🤖 ${title}"$'\n'"${msg}"
 }
 
-# Roda /usage e devolve o texto do campo "result".
-fetch_usage() {
+# Roda /usage uma vez e devolve o texto do campo "result".
+fetch_usage_once() {
   local out
   out="$(claude -p "/usage" --model "$MODEL" --output-format json </dev/null 2>/dev/null)" || return 1
+  [[ -z "$out" ]] && return 1
   if command -v jq >/dev/null 2>&1; then
     printf '%s' "$out" | jq -r '.result // empty'
   else
     printf '%s' "$out" | sed -n 's/.*"result":"\(.*\)","stop_reason".*/\1/p' | sed 's/\\n/\n/g'
   fi
+}
+
+# O `/usage` em modo -p é uma resposta gerada pelo modelo: às vezes vem a tabela
+# completa ("Current session: X% used · resets ..."), às vezes só uma frase
+# genérica, às vezes vazio. Tentamos algumas vezes até obter uma resposta que
+# contenha os percentuais; caso contrário, falhamos para o chamador tratar.
+FETCH_RETRIES="${FETCH_RETRIES:-3}"
+fetch_usage() {
+  local attempt usage
+  for (( attempt = 1; attempt <= FETCH_RETRIES; attempt++ )); do
+    usage="$(fetch_usage_once)" || usage=""
+    if printf '%s' "$usage" | grep -qiE 'Current session|% used'; then
+      printf '%s' "$usage"
+      return 0
+    fi
+    (( attempt < FETCH_RETRIES )) && sleep 2
+  done
+  return 1
 }
 
 # Extrai "<percent>|<reset>" de uma linha do /usage que comece com $2.
@@ -147,7 +166,10 @@ check_window() {
 
 check_once() {
   local usage s w s_pct s_reset w_pct w_reset
-  usage="$(fetch_usage)" || { log "⚠️  falha ao consultar /usage"; return 1; }
+  usage="$(fetch_usage)" || {
+    log "⚠️  /usage não retornou os percentuais (resposta vazia/genérica após ${FETCH_RETRIES} tentativas); tentando de novo no próximo ciclo."
+    return 1
+  }
   print_status "$usage"
 
   s="$(parse_line "$usage" "Current session")"; s_pct="${s%%|*}"; s_reset="${s#*|}"

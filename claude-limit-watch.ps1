@@ -54,7 +54,7 @@ function Env($name, $default) {
   if ([string]::IsNullOrWhiteSpace($v)) { return $default } else { return $v }
 }
 
-$Interval      = [int](Env 'INTERVAL' '60')
+$Interval      = [int](Env 'INTERVAL' '300')  # 5 minutos
 $Model         = Env 'MODEL' 'haiku'
 $DropThreshold = [int](Env 'DROP_THRESHOLD' '5')
 # Sons do sistema (System.Media.SystemSounds): Asterisk, Beep, Exclamation, Hand, Question
@@ -138,13 +138,27 @@ function Notify($title, $msg, $sound = 'Beep') {
   Send-Telegram "🤖 $title`n$msg"
 }
 
-# Roda /usage e devolve o texto do campo "result".
-function Get-Usage {
+# Roda /usage uma vez e devolve o texto do campo "result".
+function Get-UsageOnce {
   try {
     $out = & claude -p "/usage" --model $Model --output-format json 2>$null
     if (-not $out) { return $null }
     return ($out | ConvertFrom-Json).result
   } catch { return $null }
+}
+
+# O `/usage` em modo -p é uma resposta gerada pelo modelo: às vezes vem a tabela
+# completa ("Current session: X% used · resets ..."), às vezes só uma frase
+# genérica, às vezes vazio. Tentamos algumas vezes até obter uma resposta que
+# contenha os percentuais; caso contrário, devolvemos $null para o chamador tratar.
+$script:FetchRetries = if ($env:FETCH_RETRIES) { [int]$env:FETCH_RETRIES } else { 3 }
+function Get-Usage {
+  for ($attempt = 1; $attempt -le $script:FetchRetries; $attempt++) {
+    $usage = Get-UsageOnce
+    if ($usage -and ($usage -match 'Current session|% used')) { return $usage }
+    if ($attempt -lt $script:FetchRetries) { Start-Sleep -Seconds 2 }
+  }
+  return $null
 }
 
 # Extrai @{ Pct; Reset } de uma linha do /usage que contenha $prefix.
@@ -185,7 +199,10 @@ function Check-Window($label, $key, $pct, $reset, $sound) {
 
 function Check-Once {
   $usage = Get-Usage
-  if (-not $usage) { Write-Log "⚠️  falha ao consultar /usage"; return $false }
+  if (-not $usage) {
+    Write-Log "⚠️  /usage não retornou os percentuais (resposta vazia/genérica após $($script:FetchRetries) tentativas); tentando de novo no próximo ciclo."
+    return $false
+  }
   Print-Status $usage
 
   $s = Parse-Line $usage 'Current session'

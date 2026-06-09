@@ -13,6 +13,8 @@ Current week (Sonnet only): 0% used
 - **Current session** → janela de **5 horas**
 - **Current week (all models)** → janela **semanal**
 
+> ℹ️ A resposta do `/usage` em modo `-p` é **gerada pelo modelo**, então às vezes vem vazia ou sem os percentuais. Por isso cada ciclo tenta ler até `FETCH_RETRIES` vezes (padrão 3) antes de pular o ciclo; leituras inválidas são ignoradas sem disparar alerta falso.
+
 ## Como ele detecta um reset
 
 Para cada janela (5h e semanal), dispara uma notificação quando:
@@ -97,8 +99,9 @@ Tudo é controlado por variáveis de ambiente (com valores padrão):
 
 | Variável         | Padrão                      | Descrição |
 |------------------|-----------------------------|-----------|
-| `INTERVAL`       | `60`                        | Intervalo entre checagens, em segundos (modo `watch`). |
+| `INTERVAL`       | `300`                       | Intervalo entre checagens, em segundos (modo `watch`). Padrão: 5 minutos. |
 | `MODEL`          | `haiku`                     | Modelo usado na chamada `/usage`. |
+| `FETCH_RETRIES`  | `3`                         | Tentativas de ler o `/usage` por ciclo até obter os percentuais (a resposta é gerada pelo modelo e às vezes vem vazia/genérica). |
 | `DROP_THRESHOLD` | `5`                         | Queda mínima de % para considerar que a cota liberou. |
 | `SOUND_5H`       | macOS `Ping` · Linux `message-new-instant` · Win `Asterisk` | Som da notificação da janela de 5h. |
 | `SOUND_WEEK`     | macOS `Submarine` · Linux `complete` · Win `Exclamation`    | Som da notificação da janela semanal. |
@@ -116,7 +119,7 @@ Valores de som por plataforma:
 Exemplos (macOS/Linux):
 
 ```bash
-INTERVAL=120 ./claude-limit-watch.sh           # checa a cada 2 minutos
+INTERVAL=60 ./claude-limit-watch.sh            # checa a cada 1 minuto (padrão é 300 = 5 min)
 DROP_THRESHOLD=10 ./claude-limit-watch.sh once # só alerta se o uso cair >10%
 ```
 
