@@ -1,0 +1,6 @@
+# Credenciais / segredos
+.env
+telegram.env
+
+# macOS
+.DS_Store

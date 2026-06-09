@@ -39,15 +39,19 @@ LOG_FILE="$STATE_DIR/watch.log"
 mkdir -p "$STATE_DIR"
 
 # --- Telegram (opcional) ---
-# Defina TG_TOKEN (do @BotFather) e TG_CHAT_ID para receber as notificações no
-# Telegram. TG_CHAT_ID pode ser de um usuário, de um GRUPO (número negativo) ou
+# Defina o token (do @BotFather) e o chat_id para receber as notificações no
+# Telegram. O chat_id pode ser de um usuário, de um GRUPO (número negativo) ou
 # de um canal, e aceita vários separados por vírgula: "123,-100456,@canal".
-# Dica: ponha esses valores em ~/.claude/limit-watch/telegram.env (uma linha
-# TG_TOKEN=... e outra TG_CHAT_ID=...) que o script carrega sozinho.
+# Aceita os nomes TG_TOKEN/TG_CHAT_ID ou TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID.
+# Os valores são carregados automaticamente de, na ordem:
+#   1) ~/.claude/limit-watch/telegram.env
+#   2) ./.env  (na pasta do script)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TG_ENV_FILE="${TG_ENV_FILE:-$STATE_DIR/telegram.env}"
-[[ -f "$TG_ENV_FILE" ]] && source "$TG_ENV_FILE"
-TG_TOKEN="${TG_TOKEN:-}"
-TG_CHAT_ID="${TG_CHAT_ID:-}"
+[[ -f "$TG_ENV_FILE" ]] && set -a && source "$TG_ENV_FILE" && set +a
+[[ -f "$SCRIPT_DIR/.env" ]] && set -a && source "$SCRIPT_DIR/.env" && set +a
+TG_TOKEN="${TG_TOKEN:-${TELEGRAM_BOT_TOKEN:-}}"
+TG_CHAT_ID="${TG_CHAT_ID:-${TELEGRAM_CHAT_ID:-}}"
 
 # ---------- utilidades ----------
 ts() { date "+%Y-%m-%d %H:%M:%S"; }
