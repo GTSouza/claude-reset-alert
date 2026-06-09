@@ -59,10 +59,19 @@ Tudo é controlado por variáveis de ambiente (com valores padrão):
 | `SOUND_WEEK`     | `Submarine`                 | Som da notificação da janela semanal. |
 | `STATE_DIR`      | `~/.claude/limit-watch`     | Onde ficam o log e o estado das janelas. |
 | `TG_ENV_FILE`    | `$STATE_DIR/telegram.env`   | Arquivo carregado automaticamente com as credenciais do Telegram. |
-| `TG_TOKEN`       | —                           | Token do bot (do `@BotFather`). |
-| `TG_CHAT_ID`     | —                           | Um ou mais chat_ids separados por vírgula. |
+| `TG_TOKEN`       | —                           | Token do bot (do `@BotFather`). Alias: `TELEGRAM_BOT_TOKEN`. |
+| `TG_CHAT_ID`     | —                           | Um ou mais chat_ids separados por vírgula. Alias: `TELEGRAM_CHAT_ID`. |
 
 Os sons disponíveis estão em `/System/Library/Sounds` (ex.: `Glass`, `Ping`, `Submarine`, `Hero`, `Sosumi`).
+
+### Onde colocar as credenciais
+
+O script carrega as variáveis automaticamente, nesta ordem (a primeira que existir já vale):
+
+1. `~/.claude/limit-watch/telegram.env`
+2. `.env` na pasta do script
+
+Para o Telegram, aceita tanto `TG_TOKEN`/`TG_CHAT_ID` quanto `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`.
 
 Exemplos:
 
@@ -81,14 +90,18 @@ DROP_THRESHOLD=10 ./claude-limit-watch.sh once # só alerta se o uso cair >10%
    TG_TOKEN=seu_token ./claude-limit-watch.sh getid
    ```
 
-4. Salve as credenciais em `~/.claude/limit-watch/telegram.env` para o script carregar sozinho:
+4. Salve as credenciais para o script carregar sozinho. Crie um `.env` na pasta
+   do script (ou `~/.claude/limit-watch/telegram.env`):
 
    ```
-   TG_TOKEN=123456:ABC-DEF...
-   TG_CHAT_ID=123456789
+   TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+   TELEGRAM_CHAT_ID=123456789
    ```
 
-   O `TG_CHAT_ID` aceita usuário, **grupo** (número negativo), canal (`@canal`) e vários valores separados por vírgula: `123,-100456,@canal`.
+   > Os nomes `TG_TOKEN`/`TG_CHAT_ID` também funcionam. O `.env` da pasta do
+   > script **já está no `.gitignore`** — não comite suas credenciais.
+
+   O chat_id aceita usuário, **grupo** (número negativo), canal (`@canal`) e vários valores separados por vírgula: `123,-100456,@canal`.
 
 ## Estado e log
 
