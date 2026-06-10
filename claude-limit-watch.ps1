@@ -17,7 +17,7 @@
     - "Current week (all ...)" -> janela semanal
 
   Detecção de reset (por janela):
-    1) o horário de reset avança para um novo valor  -> nova janela
+    1) o instante de reset avança além de RESET_TOLERANCE -> nova janela
     2) o % de uso cai além de DropThreshold          -> cota liberou antes do previsto
     Em ambos os casos: notificação no Windows (toast) + som + Telegram.
 
@@ -32,7 +32,7 @@
 
 .NOTES
   Configuração por variáveis de ambiente: INTERVAL, MODEL, DROP_THRESHOLD,
-  SOUND_5H, SOUND_WEEK, STATE_DIR, TG_TOKEN/TG_CHAT_ID ou
+  RESET_TOLERANCE, SOUND_5H, SOUND_WEEK, STATE_DIR, TG_TOKEN/TG_CHAT_ID ou
   TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID.
 
   Para sair de um `watch` em loop, use Ctrl+C.
@@ -57,6 +57,8 @@ function Env($name, $default) {
 $Interval      = [int](Env 'INTERVAL' '300')  # 5 minutos
 $Model         = Env 'MODEL' 'haiku'
 $DropThreshold = [int](Env 'DROP_THRESHOLD' '5')
+# segundos: variação no horário de reset que NÃO conta como nova janela (evita falso positivo de "3pm" vs "2:59pm")
+$ResetTolerance = [int](Env 'RESET_TOLERANCE' '600')
 # Sons do sistema (System.Media.SystemSounds): Asterisk, Beep, Exclamation, Hand, Question
 $Sound5h       = Env 'SOUND_5H' 'Asterisk'
 $SoundWeek     = Env 'SOUND_WEEK' 'Exclamation'
@@ -178,6 +180,25 @@ function Print-Status($usage) {
   Write-Log ("📊 5h: {0}% usado · reset {1}  |  semanal: {2}% usado · reset {3}" -f $s.Pct, $s.Reset, $w.Pct, $w.Reset)
 }
 
+# Converte um horário de reset ("Jun 10 at 3pm (America/Sao_Paulo)") em DateTime.
+# O texto vem do modelo e arredonda os minutos a cada poll (3pm <-> 2:59pm),
+# então comparamos instantes com tolerância em vez de comparar strings.
+# Devolve $null se não conseguir interpretar.
+function Reset-ToDateTime($reset) {
+  if (-not $reset) { return $null }
+  $s = ($reset -replace '\s*\(.*\)\s*$', '').Trim()   # remove " (timezone)"
+  $s = $s -replace '\s+at\s+', ' '                     # "Jun 10 at 3pm" -> "Jun 10 3pm"
+  if ($s -notmatch '(?i)\d(am|pm)$') { $s = $s -replace '(?i)(\d)(am|pm)$', '$1:00$2' }
+  $s = "$s $((Get-Date).Year)"
+  $fmts = @('MMM d h:mmtt yyyy','MMM dd h:mmtt yyyy','MMM d hh:mmtt yyyy','MMM dd hh:mmtt yyyy')
+  $ci = [System.Globalization.CultureInfo]::InvariantCulture
+  $dt = [datetime]::MinValue
+  foreach ($f in $fmts) {
+    if ([datetime]::TryParseExact($s, $f, $ci, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
+  }
+  return $null
+}
+
 # Avalia uma janela: detecta reset por mudança de horário OU por queda do %.
 function Check-Window($label, $key, $pct, $reset, $sound) {
   $rf = Join-Path $StateDir "last_${key}_reset"
@@ -185,7 +206,22 @@ function Check-Window($label, $key, $pct, $reset, $sound) {
   $prevReset = if (Test-Path $rf) { (Get-Content $rf -Raw).Trim() } else { '' }
   $prevPct   = if (Test-Path $pf) { (Get-Content $pf -Raw).Trim() } else { '' }
 
+  # Reset por horário: só conta como nova janela se o instante avançou ALÉM da
+  # tolerância. Assim "3pm" virar "2:59pm" (mesmo reset, arredondado) é ignorado,
+  # mas um salto real (~5h ou ~1 semana à frente) dispara. Se algum horário não
+  # for interpretável, caímos para a comparação literal de strings.
+  $resetAdvanced = $false
   if ($reset -and $prevReset -and ($reset -ne $prevReset)) {
+    $curE = Reset-ToDateTime $reset
+    $prevE = Reset-ToDateTime $prevReset
+    if ($null -ne $curE -and $null -ne $prevE) {
+      if (($curE - $prevE).TotalSeconds -gt $ResetTolerance) { $resetAdvanced = $true }
+    } else {
+      $resetAdvanced = $true
+    }
+  }
+
+  if ($resetAdvanced) {
     Notify "Claude Code: $label resetou ✅" "Nova janela. Próximo reset: $reset" $sound
   }
   elseif ($null -ne $pct -and $prevPct -ne '' -and ([int]$pct -lt ([int]$prevPct - $DropThreshold))) {

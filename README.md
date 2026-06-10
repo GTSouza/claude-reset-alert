@@ -19,8 +19,10 @@ Current week (Sonnet only): 0% used
 
 Para cada janela (5h e semanal), dispara uma notificação quando:
 
-1. **O horário de reset avança** para um novo valor → começou uma nova janela; ou
+1. **O horário de reset avança** além de `RESET_TOLERANCE` → começou uma nova janela; ou
 2. **O % de uso cai** além de `DROP_THRESHOLD` → a cota liberou antes do previsto.
+
+> O texto do `/usage` arredonda os minutos a cada consulta (ex.: `3pm` ↔ `2:59pm`), então a detecção compara o **instante** do reset com tolerância (`RESET_TOLERANCE`, padrão 600s) em vez do texto literal — assim variações de poucos minutos não geram falsos alertas de reset.
 
 Em ambos os casos você recebe: **notificação no desktop** + **som** (distinto por janela) + **mensagem no Telegram** (se configurado).
 
@@ -103,6 +105,7 @@ Tudo é controlado por variáveis de ambiente (com valores padrão):
 | `MODEL`          | `haiku`                     | Modelo usado na chamada `/usage`. |
 | `FETCH_RETRIES`  | `3`                         | Tentativas de ler o `/usage` por ciclo até obter os percentuais (a resposta é gerada pelo modelo e às vezes vem vazia/genérica). |
 | `DROP_THRESHOLD` | `5`                         | Queda mínima de % para considerar que a cota liberou. |
+| `RESET_TOLERANCE`| `600`                       | Segundos de variação no horário de reset que **não** contam como nova janela (evita falso positivo de `3pm` vs `2:59pm`). |
 | `SOUND_5H`       | macOS `Ping` · Linux `message-new-instant` · Win `Asterisk` | Som da notificação da janela de 5h. |
 | `SOUND_WEEK`     | macOS `Submarine` · Linux `complete` · Win `Exclamation`    | Som da notificação da janela semanal. |
 | `STATE_DIR`      | `~/.claude/limit-watch`     | Onde ficam o log e o estado das janelas. |

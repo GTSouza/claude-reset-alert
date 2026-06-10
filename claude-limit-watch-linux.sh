@@ -15,7 +15,7 @@
 #   - "Current week (all ...)" -> janela semanal
 #
 # Detecção de reset (por janela):
-#   1) o horário de reset avança para um novo valor  -> nova janela
+#   1) o instante de reset avança além de RESET_TOLERANCE -> nova janela
 #   2) o % de uso cai além de DROP_THRESHOLD         -> cota liberou antes do previsto
 #   Em ambos os casos: notificação no desktop (notify-send) + som + Telegram.
 #
@@ -34,6 +34,7 @@ set -uo pipefail
 INTERVAL="${INTERVAL:-300}"  # 5 minutos
 MODEL="${MODEL:-haiku}"
 DROP_THRESHOLD="${DROP_THRESHOLD:-5}"  # queda mínima de % p/ considerar que a cota liberou
+RESET_TOLERANCE="${RESET_TOLERANCE:-600}"  # segundos: variação no horário de reset que NÃO conta como nova janela (evita falso positivo de "3pm" vs "2:59pm")
 # Eventos do tema de som freedesktop (usados por canberra-gtk-play -i <evento>).
 SOUND_5H="${SOUND_5H:-message-new-instant}"  # som da janela de 5h
 SOUND_WEEK="${SOUND_WEEK:-complete}"         # som da janela semanal
@@ -128,6 +129,32 @@ fetch_usage() {
   return 1
 }
 
+# Converte um horário de reset ("Jun 10 at 3pm (America/Sao_Paulo)") em epoch.
+# O texto vem do modelo e arredonda os minutos a cada poll (3pm <-> 2:59pm),
+# então comparamos instantes com tolerância em vez de comparar strings.
+# Devolve vazio (e código !=0) se não conseguir interpretar.
+reset_to_epoch() { # "Mon DD at H[:MM]am/pm (tz)"
+  local s="$1" mon day tm ampm hh mm year norm
+  s="${s%% (*}"                                   # remove " (timezone)"
+  s="$(printf '%s' "$s" | tr -s ' ')"
+  mon="$(printf '%s' "$s" | awk '{print $1}')"
+  day="$(printf '%s' "$s" | awk '{print $2}')"
+  tm="$(printf '%s'  "$s" | sed -n 's/.* at \(.*\)$/\1/p')"
+  [[ -z "$mon" || -z "$day" || -z "$tm" ]] && return 1
+  ampm="$(printf '%s' "$tm" | grep -oiE '[ap]m$' | tr '[:lower:]' '[:upper:]')"
+  tm="$(printf '%s' "$tm" | sed -E 's/[aApP][mM]$//')"
+  if [[ "$tm" == *:* ]]; then hh="${tm%%:*}"; mm="${tm#*:}"; else hh="$tm"; mm="00"; fi
+  printf -v hh '%02d' "$hh" 2>/dev/null || return 1
+  printf -v mm '%02d' "$mm" 2>/dev/null || return 1
+  year="$(date +%Y)"
+  norm="$mon $day $year $hh:$mm $ampm"
+  if date --version >/dev/null 2>&1; then          # GNU date (Linux)
+    date -d "$mon $day $year $hh:$mm $ampm" +%s 2>/dev/null
+  else                                             # BSD date (macOS)
+    date -j -f "%b %d %Y %I:%M %p" "$norm" +%s 2>/dev/null
+  fi
+}
+
 # Extrai "<percent>|<reset>" de uma linha do /usage que comece com $2.
 parse_line() { # texto, prefixo
   local line pct reset
@@ -154,7 +181,22 @@ check_window() {
   [[ -f "$rf" ]] && prev_reset="$(cat "$rf")"
   [[ -f "$pf" ]] && prev_pct="$(cat "$pf")"
 
+  # Reset por horário: só conta como nova janela se o instante avançou ALÉM da
+  # tolerância. Assim "3pm" virar "2:59pm" (mesmo reset, arredondado) é ignorado,
+  # mas um salto real (~5h ou ~1 semana à frente) dispara. Se algum horário não
+  # for interpretável, caímos para a comparação literal de strings.
+  local reset_advanced=0
   if [[ -n "$reset" && -n "$prev_reset" && "$reset" != "$prev_reset" ]]; then
+    local cur_e prev_e
+    cur_e="$(reset_to_epoch "$reset")"; prev_e="$(reset_to_epoch "$prev_reset")"
+    if [[ -n "$cur_e" && -n "$prev_e" ]]; then
+      (( cur_e - prev_e > RESET_TOLERANCE )) && reset_advanced=1
+    else
+      reset_advanced=1
+    fi
+  fi
+
+  if (( reset_advanced )); then
     notify "Claude Code: $label resetou ✅" "Nova janela. Próximo reset: $reset" "$sound"
   elif [[ -n "$pct" && -n "$prev_pct" ]] && (( pct < prev_pct - DROP_THRESHOLD )); then
     notify "Claude Code: cota da janela $label liberou ⬇️" "Uso caiu de ${prev_pct}% para ${pct}% (reset previsto: ${reset:-?})" "$sound"
