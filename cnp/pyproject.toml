@@ -1,0 +1,10 @@
+[project]
+name = "telegram-mcp"
+version = "0.1.0"
+description = "MCP server and client for Telegram Bot API"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp[cli]>=1.8.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.1.0",
+]
