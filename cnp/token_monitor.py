@@ -24,6 +24,8 @@ Uso — medidor oficial (porte do claude-limit-watch.sh, custo zero):
   python3 token_monitor.py meter             # 1 leitura de /usage (grava 5h%/semanal%/eventos)
   python3 token_monitor.py meter --watch --interval 300   # loop; alerta cap_5h/credits_started/reset/drop
   python3 token_monitor.py meter-report      # histórico do medidor
+  python3 token_monitor.py gate              # veredito GO/PAUSE p/ runners (exit 0/10/2); usa cache, refaz se velho
+  python3 token_monitor.py gate --json --max-5h 80 --max-week 90   # decisão estruturada p/ automação
 
 Uso — calibração de custo (aprende fator por modelo dos gastos REAIS):
   python3 token_monitor.py calibrate --brl 47.85          # registra episódio (janela=último crédito)
@@ -800,6 +802,92 @@ def meter_report(con: sqlite3.Connection, args) -> None:
     print()
 
 
+# ----------------------------- Gate ---------------------------------------- #
+# Decisão única "posso seguir trabalhando?" para runners contínuos (ver SKILL).
+# Lê a ÚLTIMA leitura do medidor (barato, sem chamar /usage); só faz uma leitura
+# AO VIVO se a última estiver velha (> --max-age) ou com --refresh. Assim reaproveita
+# o `meter --watch` que já popula o banco e evita gastar tempo/latência por checagem.
+# Saída legível + --json, e exit code: 0=GO · 10=PAUSE · 2=UNKNOWN (sem leitura).
+GATE_GO, GATE_PAUSE, GATE_UNKNOWN = 0, 10, 2
+
+
+def _latest_meter(con: sqlite3.Connection):
+    return con.execute(
+        "SELECT ts_epoch, session_pct, session_reset, week_pct, week_reset "
+        "FROM meter ORDER BY ts_epoch DESC LIMIT 1"
+    ).fetchone()
+
+
+def gate(con: sqlite3.Connection, args) -> int:
+    """Veredito de rate limit. Retorna o exit code (GO/PAUSE/UNKNOWN)."""
+    now = datetime.now(timezone.utc).timestamp()
+    row = _latest_meter(con)
+    age = (now - row[0]) if row else None
+    stale = row is None or age > args.max_age
+    refreshed = False
+    if args.refresh or stale:
+        # leitura velha/ausente → busca ao vivo (custo zero de cota) e relê o banco
+        meter_once(con, notify=not args.no_notify)
+        row = _latest_meter(con)
+        age = (now - row[0]) if row else None
+        refreshed = True
+
+    if not row or row[1] is None or row[3] is None:
+        s_pct = w_pct = s_reset = w_reset = None
+        reasons = ["sem leitura válida do medidor"]
+        decision, code = "UNKNOWN", GATE_UNKNOWN
+    else:
+        _, s_pct, s_reset, w_pct, w_reset = row
+        reasons = []
+        if s_pct >= args.max_5h:
+            reasons.append(f"5h em {s_pct}% (>= {args.max_5h}%)")
+        if w_pct >= args.max_week:
+            reasons.append(f"semanal em {w_pct}% (>= {args.max_week}%)")
+        decision = "GO" if not reasons else "PAUSE"
+        code = GATE_GO if not reasons else GATE_PAUSE
+
+    # Tudo mastigado: a própria ferramenta decide, explica e já entrega o bloco de
+    # pausa pronto pra colar. A SKILL só executa e segue o texto literalmente.
+    motivo = "; ".join(reasons) if reasons else ""
+    if decision == "GO":
+        advice = "Pode iniciar a próxima tarefa. Rode o gate de novo após 1–2 tarefas."
+    elif decision == "PAUSE":
+        advice = ("Pare. Não inicie novas tarefas. Faça commit do que está validado "
+                  "e responda no formato de pausa abaixo (preencha <N> e as listas).")
+    else:
+        advice = ("Sem leitura válida do medidor — trate como PAUSE (conservador). "
+                  "Rode `token_monitor.py meter` para forçar uma leitura ao vivo.")
+    # Cabeçalho de pausa pronto (relevante em PAUSE/UNKNOWN)
+    pause_header = (
+        "pausado: <N> tarefas restantes\n"
+        f"motivo: {motivo or 'medidor indisponível'}\n"
+        f"reset: {s_reset or '?'}\n"
+        f"semanal: {w_pct if w_pct is not None else '?'}%"
+    )
+    verdict = {"decision": decision, "reasons": reasons, "advice": advice,
+               "pause_header": None if decision == "GO" else pause_header,
+               "session_pct": s_pct, "week_pct": w_pct, "session_reset": s_reset,
+               "week_reset": w_reset, "age_seconds": int(age) if age is not None else None,
+               "refreshed": refreshed, "max_5h": args.max_5h, "max_week": args.max_week}
+
+    if args.json:
+        print(json.dumps(verdict, ensure_ascii=False))
+        return code
+
+    src = "ao vivo" if refreshed else (f"cache {verdict['age_seconds']}s" if verdict["age_seconds"] is not None else "—")
+    print(f"📊 5h: {s_pct}% · reset {s_reset}  |  semanal: {w_pct}% · reset {w_reset}  ({src})")
+    if motivo:
+        print(f"motivo: {motivo}")
+    print(f"DECISION: {decision}")
+    icon = {"GO": "➡️ ", "PAUSE": "🛑", "UNKNOWN": "⚠️ "}[decision]
+    print(f"{icon} {advice}")
+    if decision != "GO":
+        print("─────── cole e complete ───────")
+        print(pause_header)
+        print("────────────────────────────────")
+    return code
+
+
 # --------------------------- Bursts ---------------------------------------- #
 # Detalhamento por "burst" = cluster de atividade separado por gap de inatividade.
 # Lê os transcripts crus (gatilho/sidechain/entrypoint não estão na tabela usage)
@@ -1089,6 +1177,15 @@ def main() -> None:
     mr = sub.add_parser("meter-report", help="histórico do medidor oficial")
     mr.add_argument("--limit", type=int, default=30)
 
+    gp = sub.add_parser("gate", help="veredito GO/PAUSE de rate limit (exit 0/10/2) p/ runners")
+    gp.add_argument("--max-5h", dest="max_5h", type=int, default=80, help="teto da janela 5h em %% (default 80)")
+    gp.add_argument("--max-week", dest="max_week", type=int, default=90, help="teto semanal em %% (default 90)")
+    gp.add_argument("--max-age", dest="max_age", type=int, default=300,
+                    help="segundos: leitura mais velha que isto dispara medida ao vivo (default 300)")
+    gp.add_argument("--refresh", action="store_true", help="força leitura ao vivo do /usage agora")
+    gp.add_argument("--json", action="store_true", help="saída JSON em vez de texto")
+    gp.add_argument("--no-notify", action="store_true", help="não notificar ao refazer a leitura")
+
     cp = sub.add_parser("calibrate", help="aprende fator de preço por modelo a partir de gastos reais de crédito",
                         parents=[common])
     cp.add_argument("--brl", type=float, help="gasto real em R$ (converte por --rate)")
@@ -1133,6 +1230,10 @@ def main() -> None:
             meter_once(con, notify=notify)
     elif args.cmd == "meter-report":
         meter_report(con, args)
+    elif args.cmd == "gate":
+        code = gate(con, args)
+        con.close()
+        sys.exit(code)
     elif args.cmd == "bursts":
         bursts_report(con, args)
     elif args.cmd == "calibrate":
