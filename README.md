@@ -1,4 +1,21 @@
-# claude-limit-watch
+# claude-reset-alert
+
+Toolkit para **monitorar e governar o uso do Claude Code** (assinatura + créditos): avisa quando os limites resetam, mede o consumo real de tokens/custo, decide quando pausar para não bater rate limit e expõe tudo no Telegram.
+
+## Componentes
+
+| Componente | O que faz | Docs |
+|---|---|---|
+| **Watchers de limite** (`claude-limit-watch.{sh,linux.sh,ps1}`) | Vigiam o `/usage` em loop e notificam reset / liberação de cota (desktop + som + Telegram). Um script por SO. | esta página |
+| **Monitor de tokens** ([`cnp/token_monitor.py`](cnp/token_monitor.py)) | Lê os transcripts `.jsonl`, agrega uso por janela/modelo/sessão/billing em SQLite, mede o `/usage` (custo zero), calibra custo real e decide GO/PAUSE via `gate`. | [seção abaixo](#monitor-de-tokens-cnptoken_monitorpy) |
+| **Telegram MCP** ([`cnp/`](cnp/)) | Servidor MCP + bridge que envia relatórios e responde no Telegram via Claude. | [cnp/README.md](cnp/README.md) |
+| **Skill runner seguro** ([`ultracode-continuous-safe-runner/`](ultracode-continuous-safe-runner/SKILL.md)) | Skill de trabalho contínuo, incremental e retomável que consulta o `gate` antes de cada lote e pausa com checkpoint antes do teto. | [seção abaixo](#skill-runner-contínuo-seguro) |
+
+Os watchers e o `token_monitor.py` compartilham o mesmo arquivo de log (`~/.claude/limit-watch/watch.log`): o monitor importa o histórico do watcher para a tabela `meter`.
+
+---
+
+## Watchers de limite (shell)
 
 Monitora os limites de uso do **Claude Code** (assinatura) e te avisa quando eles **resetam** ou quando a cota **libera antes do horário previsto**.
 
@@ -228,3 +245,67 @@ Para "resetar" a memória do script (e tratar a próxima checagem como a primeir
 ```bash
 rm ~/.claude/limit-watch/last_*
 ```
+
+---
+
+## Monitor de tokens (`cnp/token_monitor.py`)
+
+Enquanto os watchers só olham os **percentuais** do `/usage`, o `token_monitor.py` lê os transcripts `.jsonl` que o Claude Code grava em `~/.claude/projects/`, agrega o uso em **SQLite** (`~/.claude/tools/token_usage.db`) e cruza com o medidor oficial. Sem dependências externas (só stdlib).
+
+Por convenção fica em `~/.claude/tools/token_monitor.py` (a cópia versionada é [`cnp/token_monitor.py`](cnp/token_monitor.py) — mantenha as duas em sincronia).
+
+### Subcomandos
+
+| Comando | Para que serve |
+|---|---|
+| `ingest` | Varre os `.jsonl` + `watch.log` e popula o banco (idempotente, incremental). |
+| `report` | Relatório agregado por janela (`--window 5h/day/week/month`) e eixo (`--by model/session/project/day/billing/none`). `--io-only` mostra só in/out (comparável ao app do Claude). |
+| `limits` | Episódios em que você bateu o limite. |
+| `meter` | Uma leitura do `/usage` (custo zero); grava 5h%/semanal% na tabela `meter` e alerta reset/queda/cap. `--watch --interval 300` roda em loop. |
+| `meter-report` | Histórico das leituras do medidor. |
+| **`gate`** | **Veredito GO/PAUSE de rate limit** para runners — ver abaixo. |
+| `calibrate` | Aprende o fator de custo real por modelo a partir de gastos reais de crédito (`--brl`/`--usd`, `--solve`, `--apply`). |
+| `bursts` | Detalha clusters de atividade (gatilho manual × wakeup × task, billing, modelos, cap). |
+
+> **Billing assinatura × crédito:** o monitor marca como `credits` o uso real produzido **depois** do medidor 5h ser confirmado em 100%, e como `subscription` o resto. Os relatórios `--by billing` e os custos `~USD` (calibrados via `calibrate`) saem desse cruzamento.
+
+### Gate de rate limit (para runners)
+
+O `gate` é o ponto de decisão único "**posso seguir trabalhando?**". Lê a última leitura do medidor do banco (custo zero) e só refaz uma leitura ao vivo se a anterior estiver velha (`--max-age`, padrão 300s). Aplica os tetos de 5h e semanal **juntos** e já entrega tudo mastigado:
+
+```bash
+~/.claude/tools/token_monitor.py gate            # texto: DECISION + conselho + bloco de pausa pronto
+~/.claude/tools/token_monitor.py gate --json     # mesmos campos (advice, pause_header, ...) p/ automação
+```
+
+Saída em `PAUSE`:
+
+```text
+📊 5h: 95% · reset Jun 11 at 4:39pm (America/Sao_Paulo)  |  semanal: 80% · reset ...  (cache 199s)
+motivo: 5h em 95% (>= 80%)
+DECISION: PAUSE
+🛑 Pare. Não inicie novas tarefas. Faça commit do que está validado e responda no formato de pausa abaixo...
+─────── cole e complete ───────
+pausado: <N> tarefas restantes
+motivo: 5h em 95% (>= 80%)
+reset: Jun 11 at 4:39pm (America/Sao_Paulo)
+semanal: 80%
+────────────────────────────────
+```
+
+**Exit codes:** `0` = GO · `10` = PAUSE · `2` = UNKNOWN (sem leitura — trate como pausa).
+
+| Flag | Padrão | Descrição |
+|---|---|---|
+| `--max-5h` | `80` | Teto da janela de 5h em %. |
+| `--max-week` | `90` | Teto semanal em %. |
+| `--max-age` | `300` | Segundos: leitura mais velha que isto dispara uma medição ao vivo. |
+| `--refresh` | — | Força a leitura ao vivo do `/usage` agora. |
+| `--json` | — | Saída estruturada em vez de texto. |
+| `--no-notify` | — | Não notifica ao refazer a leitura. |
+
+---
+
+## Skill: runner contínuo seguro
+
+A skill [`ultracode-continuous-safe-runner`](ultracode-continuous-safe-runner/SKILL.md) orquestra trabalho **contínuo, incremental e retomável**: quebra a demanda em tarefas pequenas, valida e faz **um commit por tarefa**, consulta o `gate` a cada 1–2 tarefas e, em `PAUSE`, salva checkpoint e para antes de bater o limite. Toda a lógica de rate limit é delegada ao `gate` — a skill só executa o comando e segue a saída.
