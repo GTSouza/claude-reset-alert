@@ -15,6 +15,7 @@ Uso — tokens & relatórios:
   python3 token_monitor.py report --window 5h
   python3 token_monitor.py report --since 2026-06-01 --by billing   # assinatura × crédito
   python3 token_monitor.py report --by model --model claude-fable-5 --session 86e5a22d
+  python3 token_monitor.py report --by model --io-only   # só in/out+%out (comparável ao app do Claude)
   python3 token_monitor.py limits            # episódios de batida de limite
   python3 token_monitor.py bursts --session 86e5a22d  # timeline detalhada (gatilho/billing/cap)
   python3 token_monitor.py watch             # ingest contínuo
@@ -32,9 +33,12 @@ Uso — calibração de custo (aprende fator por modelo dos gastos REAIS):
 
 Eixos (--by): model | session | project | day | billing | none(global)
 Janelas (--window): 5h | day | week | month
+--io-only: esconde cache/custo, mostra só in/out + %out (o app do Claude mostra ISSO, não cache);
+  difere do app por: (1) app=conta toda/todas as máquinas, ferramenta=.jsonl local; (2) data do
+  snapshot do app; (3) o app omite cache. Validação: Sonnet 4.6 bate exato (73.1k in / 6.2M out).
 Custo: base PRICING × fator do modelo (calibrado); ~USD. Modelo sem dado real = fator 1.0.
 Billing: token real enquanto medidor 5h==100% (após cap confirmado) = crédito; senão assinatura.
-Env úteis: METER_TZ, CREDIT_PCT, METER_TOL, RESET_TOLERANCE, DROP_THRESHOLD, FACTORS_PATH.
+Env úteis: METER_TZ, CREDIT_PCT, RESET_TOLERANCE, DROP_THRESHOLD, FACTORS_PATH.
 """
 from __future__ import annotations
 
@@ -56,6 +60,24 @@ try:
 except Exception:  # pragma: no cover
     ZoneInfo = None
 
+
+def _load_dotenv(path: Path) -> None:
+    """Carrega KEY=VAL do .env para os.environ (sem sobrescrever o que já existe)."""
+    if not path.is_file():
+        return
+    for line in path.read_text(errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        if k and k not in os.environ:
+            os.environ[k] = v.strip().strip('"').strip("'")
+
+
+# .env na raiz do próprio script (ex.: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)
+_load_dotenv(Path(__file__).resolve().parent / ".env")
+
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 DB_PATH = Path.home() / ".claude" / "tools" / "token_usage.db"
 
@@ -74,13 +96,16 @@ TG_ENV_FILE = Path(os.environ.get("TG_ENV_FILE", str(Path.home() / ".claude" / "
 # dado real fica com fator 1.0 (nominal) — ver `calibrate --solve`.
 PRICING = {
     "claude-fable-5":         {"in": 10.0, "out": 50.0, "cache_read": 1.00, "cache_write": 12.50},
-    "claude-fable-5[1m]":     {"in": 10.0, "out": 50.0, "cache_read": 1.00, "cache_write": 12.50},
     "claude-opus-4-8":        {"in": 5.0,  "out": 25.0, "cache_read": 0.50, "cache_write": 6.25},
-    "claude-opus-4-8[1m]":    {"in": 5.0,  "out": 25.0, "cache_read": 0.50, "cache_write": 6.25},
     "claude-sonnet-4-6":      {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75},
     "claude-haiku-4-5":       {"in": 1.0,  "out": 5.0,  "cache_read": 0.10, "cache_write": 1.25},
     "_default":               {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75},
 }
+
+
+def _norm_model(model: str | None) -> str:
+    """Variantes como 'claude-fable-5[1m]' compartilham preço/fator com o modelo base."""
+    return (model or "_default").split("[")[0]
 
 # Fatores por modelo (base × fator = custo real), persistidos em JSON e aprendidos
 # via `calibrate`. Carregados uma vez; default 1.0 para modelo sem calibração.
@@ -102,6 +127,14 @@ LIMIT_PATTERNS = re.compile(
     r"hit your (session|usage|\w+) limit\b.*\bresets\b",
     re.IGNORECASE,
 )
+
+# Predicado único de "modelo real" (exclui synthetic/<local>) — versões SQL e Python
+# lado a lado para não divergirem. Gate de billing, calibração e bursts.
+REAL_MODEL_SQL = "model LIKE 'claude%'"
+
+
+def is_real_model(model: str | None) -> bool:
+    return bool(model) and model.startswith("claude")
 
 
 # ----------------------------- DB ------------------------------------------ #
@@ -164,6 +197,14 @@ def db_connect() -> sqlite3.Connection:
             tokens_json TEXT         -- {model: {in,out,cr,cw}} do episódio
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS ingest_state (
+            path TEXT PRIMARY KEY,   -- .jsonl ou watch.log
+            mtime REAL,
+            size INTEGER,
+            offset INTEGER           -- byte após a última linha completa lida
+        )
+    """)
     # Migração: coluna billing_source (subscription | credits) sem recriar o banco.
     cols = {r[1] for r in con.execute("PRAGMA table_info(usage)")}
     if "billing_source" not in cols:
@@ -187,7 +228,7 @@ def ingest(con: sqlite3.Connection, verbose: bool = True) -> tuple[int, int]:
     new_usage = new_limits = 0
     for jf in PROJECTS_DIR.rglob("*.jsonl"):
         project = jf.parent.name
-        for line in _iter_lines(jf):
+        for line in _iter_new_lines(con, jf):
             try:
                 o = json.loads(line)
             except Exception:
@@ -206,28 +247,21 @@ def ingest(con: sqlite3.Connection, verbose: bool = True) -> tuple[int, int]:
             # --- limit events ---
             text = _join_text(msg.get("content"))
             if text and LIMIT_PATTERNS.search(text):
-                try:
-                    con.execute(
-                        "INSERT OR IGNORE INTO limits VALUES (?,?,?,?,?,?,?)",
-                        (uuid, ts, ts_epoch, session_id, project, model, text[:300]),
-                    )
-                    if con.total_changes:
-                        new_limits += con.total_changes and 1
-                except sqlite3.IntegrityError:
-                    pass
+                cur = con.execute(
+                    "INSERT OR IGNORE INTO limits VALUES (?,?,?,?,?,?,?)",
+                    (uuid, ts, ts_epoch, session_id, project, model, text[:300]),
+                )
+                new_limits += max(cur.rowcount, 0)
 
             # --- usage ---
             usage = msg.get("usage")
             if not isinstance(usage, dict):
                 continue
             sv = usage.get("server_tool_use") or {}
+            t = _usage_tokens(usage)
             row = (
                 uuid, ts, ts_epoch, session_id, project, o.get("gitBranch"),
-                model,
-                int(usage.get("input_tokens", 0) or 0),
-                int(usage.get("output_tokens", 0) or 0),
-                int(usage.get("cache_read_input_tokens", 0) or 0),
-                int(usage.get("cache_creation_input_tokens", 0) or 0),
+                model, t["in"], t["out"], t["cr"], t["cw"],
                 int(sv.get("web_search_requests", 0) or 0),
                 int(sv.get("web_fetch_requests", 0) or 0),
                 usage.get("service_tier"),
@@ -239,7 +273,7 @@ def ingest(con: sqlite3.Connection, verbose: bool = True) -> tuple[int, int]:
                 "web_search, web_fetch, service_tier) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row
             )
-            new_usage += cur.rowcount if cur.rowcount > 0 else 0
+            new_usage += max(cur.rowcount, 0)
     con.commit()
     n_log = ingest_watchlog(con)
     n_credits = compute_billing(con)
@@ -262,13 +296,14 @@ def ingest_watchlog(con: sqlite3.Connection) -> int:
     """Importa o histórico do claude-limit-watch.sh (watch.log) para a tabela meter.
 
     O timestamp do log é hora LOCAL (METER_TZ); convertemos para UTC. Idempotente
-    via PRIMARY KEY (ts). Convive com as leituras feitas pelo subcomando `meter`.
+    via PRIMARY KEY (ts) e incremental via ingest_state (só lê linhas novas).
+    Convive com as leituras feitas pelo subcomando `meter`.
     """
-    if not WATCHLOG_PATH.is_file() or ZoneInfo is None:
+    if ZoneInfo is None:
         return 0
     tz = ZoneInfo(METER_TZ)
     n = 0
-    for line in _iter_lines(WATCHLOG_PATH):
+    for line in _iter_new_lines(con, WATCHLOG_PATH):
         m = _WATCHLOG_RE.match(line.strip())
         if not m:
             continue
@@ -282,35 +317,45 @@ def ingest_watchlog(con: sqlite3.Connection) -> int:
             (dt.isoformat(), dt.timestamp(), int(s_pct), s_reset, _reset_to_epoch(s_reset),
              int(w_pct), w_reset, _reset_to_epoch(w_reset), None),
         )
-        n += cur.rowcount if cur.rowcount > 0 else 0
+        n += max(cur.rowcount, 0)
     con.commit()
     return n
 
 
 # Limiar de % do medidor 5h a partir do qual consideramos a janela CAPADA.
 CREDIT_PCT = int(os.environ.get("CREDIT_PCT", "100"))
-# Tolerância (s) entre a msg e a leitura de medidor mais próxima.
-METER_TOL = int(os.environ.get("METER_TOL", "600"))
 
 
 def compute_billing(con: sqlite3.Connection) -> int:
     """Marca usage.billing_source via MEDIDOR OFICIAL (tabela meter), não por banners.
 
-    Regra robusta: um token é 'credits' se a leitura de medidor 5h mais próxima (até
-    METER_TOL) mostra a janela capada (>= CREDIT_PCT). Com o medidor a 100%, qualquer
-    token real só existe porque o excedente estava ligado. Sem medidor próximo no
-    tempo → 'subscription' (não há como afirmar crédito).
+    Regra: os intervalos de `credit_episodes()` (medidor 5h confirmado a 100% com
+    tokens reais produzidos depois) viram 'credits'; todo o resto, 'subscription'.
+    Os UPDATEs só tocam linhas cujo valor muda, em vez de reescrever a tabela toda.
     """
-    con.execute("UPDATE usage SET billing_source='subscription'")
+    con.execute(
+        "UPDATE usage SET billing_source='subscription' "
+        "WHERE billing_source IS NOT 'subscription'"
+    )
     intervals = credit_episodes(con)
     for a, b in intervals:
         con.execute(
-            "UPDATE usage SET billing_source='credits' WHERE ts_epoch > ? AND ts_epoch <= ?",
+            "UPDATE usage SET billing_source='credits' "
+            "WHERE ts_epoch > ? AND ts_epoch <= ? AND billing_source IS NOT 'credits'",
             (a, b),
         )
     n = con.execute("SELECT COUNT(*) FROM usage WHERE billing_source='credits'").fetchone()[0]
     con.commit()
     return n
+
+
+def _real_output_tokens(con: sqlite3.Connection, a: float, b: float) -> int:
+    """Σ output_tokens de modelos reais no intervalo (a, b]."""
+    return con.execute(
+        f"SELECT COALESCE(SUM(output_tokens), 0) FROM usage "
+        f"WHERE ts_epoch > ? AND ts_epoch <= ? AND {REAL_MODEL_SQL}",
+        (a, b),
+    ).fetchone()[0]
 
 
 def credit_episodes(con: sqlite3.Connection) -> list[tuple[float, float]]:
@@ -340,12 +385,7 @@ def credit_episodes(con: sqlite3.Connection) -> list[tuple[float, float]]:
             # pescaria trabalho PÓS-reset (assinatura nova). Conservador e correto.
             cap_end = meters[j - 1][0]
             # só é crédito se houve token real ESTRITAMENTE após o 100% confirmado
-            tok = con.execute(
-                "SELECT COALESCE(SUM(output_tokens), 0) FROM usage "
-                "WHERE ts_epoch > ? AND ts_epoch <= ? AND model LIKE 'claude%'",
-                (cap_start, cap_end),
-            ).fetchone()[0]
-            if tok > 0:
+            if _real_output_tokens(con, cap_start, cap_end) > 0:
                 episodes.append((cap_start, cap_end))
             i = j
         else:
@@ -359,6 +399,50 @@ def _iter_lines(path: Path):
             yield from fh
     except OSError:
         return
+
+
+def _iter_new_lines(con: sqlite3.Connection, path: Path):
+    """Itera só as linhas NOVAS de um arquivo append-only (offset em ingest_state).
+
+    Lê em binário para rastrear o offset por bytes; linha parcial (sem '\\n', ainda
+    em escrita) fica para a próxima rodada. Arquivo truncado recomeça do zero —
+    os INSERT OR IGNORE downstream mantêm a releitura idempotente.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return
+    key = str(path)
+    prev = con.execute(
+        "SELECT mtime, size, offset FROM ingest_state WHERE path = ?", (key,)
+    ).fetchone()
+    if prev and prev[0] == st.st_mtime and prev[1] == st.st_size:
+        return
+    offset = prev[2] if prev and prev[2] <= st.st_size else 0
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            for raw in fh:
+                if not raw.endswith(b"\n"):
+                    break
+                offset += len(raw)
+                yield raw.decode("utf-8", errors="replace")
+    except OSError:
+        return
+    con.execute(
+        "INSERT OR REPLACE INTO ingest_state VALUES (?,?,?,?)",
+        (key, st.st_mtime, st.st_size, offset),
+    )
+
+
+def _usage_tokens(usage: dict) -> dict:
+    """Extrai os 4 contadores de token de um bloco `usage`, null-safe."""
+    return {
+        "in": int(usage.get("input_tokens", 0) or 0),
+        "out": int(usage.get("output_tokens", 0) or 0),
+        "cr": int(usage.get("cache_read_input_tokens", 0) or 0),
+        "cw": int(usage.get("cache_creation_input_tokens", 0) or 0),
+    }
 
 
 def _join_text(content) -> str:
@@ -382,9 +466,9 @@ WINDOWS = {
 }
 
 
-def base_cost(model: str, r: dict) -> float:
+def base_cost(model: str | None, r: dict) -> float:
     """Custo NOMINAL (sem o fator de calibração)."""
-    p = PRICING.get(model) or PRICING["_default"]
+    p = PRICING.get(_norm_model(model)) or PRICING["_default"]
     return (
         r["in"] / 1e6 * p["in"]
         + r["out"] / 1e6 * p["out"]
@@ -393,9 +477,16 @@ def base_cost(model: str, r: dict) -> float:
     )
 
 
-def cost(model: str, r: dict) -> float:
+def cost(model: str | None, r: dict) -> float:
     """Custo calibrado = base × fator do modelo (1.0 se não calibrado)."""
-    return base_cost(model, r) * FACTORS.get(model, 1.0)
+    factor = FACTORS.get(model, FACTORS.get(_norm_model(model), 1.0))
+    return base_cost(model, r) * factor
+
+
+def _cost_row(t: dict) -> dict:
+    """Adapta {in,out,cr,cw} (transcripts/episódios) para o shape de base_cost()."""
+    return {"in": t.get("in", 0), "out": t.get("out", 0),
+            "cread": t.get("cr", 0), "cwrite": t.get("cw", 0)}
 
 
 def fmt(n: int) -> str:
@@ -425,21 +516,15 @@ def report(con: sqlite3.Connection, args) -> None:
     # As mesmas colunas existem em `usage` e `limits`, então o WHERE serve aos dois.
     where = ["ts_epoch >= ?"]
     params: list = [since_epoch]
-    if getattr(args, "model", None):
-        where.append("model = ?"); params.append(args.model)
-    if getattr(args, "session", None):
-        where.append("session_id LIKE ?"); params.append(args.session + "%")
-    if getattr(args, "project", None):
-        where.append("project LIKE ?"); params.append("%" + args.project + "%")
+    for name, val, clause, param in (
+        ("model", args.model, "model = ?", args.model),
+        ("session", args.session, "session_id LIKE ?", f"{args.session}%"),
+        ("project", args.project, "project LIKE ?", f"%{args.project}%"),
+    ):
+        if val:
+            where.append(clause); params.append(param)
+            label += f" [{name}={val}]"
     where_sql = " AND ".join(where)
-    filt = "".join(
-        f" [{k}={v}]" for k, v in (
-            ("model", getattr(args, "model", None)),
-            ("session", getattr(args, "session", None)),
-            ("project", getattr(args, "project", None)),
-        ) if v
-    )
-    label += filt
 
     # SEMPRE agrupamos por (grupo, model) no SQL para que o custo use o preço
     # certo de cada modelo. As sub-linhas são somadas por grupo de exibição no
@@ -466,8 +551,27 @@ def report(con: sqlite3.Connection, args) -> None:
     for g, model, i, o, cr, cw, ws, wf, n in subrows:
         key = (str(g)[:32]) if g else "?"
         d = agg.setdefault(key, {"in": 0, "out": 0, "cread": 0, "cwrite": 0, "msgs": 0, "usd": 0.0})
-        d["usd"] += cost(model or "_default", {"in": i, "out": o, "cread": cr, "cwrite": cw})
+        d["usd"] += cost(model, {"in": i, "out": o, "cread": cr, "cwrite": cw})
         d["in"] += i; d["out"] += o; d["cread"] += cr; d["cwrite"] += cw; d["msgs"] += n
+
+    if args.io_only:
+        # Modo comparável ao app do Claude (aba Models): só in/out + % de output,
+        # SEM cache e SEM custo. Ordena por output desc.
+        ordered = sorted(agg.items(), key=lambda kv: kv[1]["out"], reverse=True)
+        tot_out = sum(d["out"] for _, d in ordered) or 1
+        header = f"{'grupo':<34} {'in':>12} {'out':>12} {'% out':>7} {'msgs':>6}"
+        print("(modo --io-only: só in/out, sem cache/custo — comparável ao app do Claude)\n")
+        print(header)
+        print("-" * len(header))
+        tot = {"in": 0, "out": 0, "msgs": 0}
+        for g_disp, d in ordered:
+            print(f"{g_disp:<34} {fmt(d['in']):>12} {fmt(d['out']):>12} {d['out'] / tot_out * 100:>6.1f}% {d['msgs']:>6}")
+            for k in tot:
+                tot[k] += d[k]
+        print("-" * len(header))
+        print(f"{'TOTAL':<34} {fmt(tot['in']):>12} {fmt(tot['out']):>12} {'100.0%':>7} {tot['msgs']:>6}")
+        print(f"\nTotal in+out: {fmt(tot['in'] + tot['out'])}  (o app mostra estes números, não o cache)\n")
+        return
 
     ordered = sorted(agg.items(), key=lambda kv: kv[1]["in"] + kv[1]["out"] + kv[1]["cread"] + kv[1]["cwrite"], reverse=True)
 
@@ -632,14 +736,16 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
     events = []
     if prev:
         p_spct, p_sre, p_wpct, p_wre = prev
-        if s_re and p_sre and s_re - p_sre > RESET_TOLERANCE:
-            events.append("reset_5h"); _notify("Claude Code: 5h resetou ✅", f"Nova janela. Próximo reset: {s_reset}", "Ping", notify)
-        elif s_pct is not None and p_spct is not None and s_pct < p_spct - DROP_THRESHOLD:
-            events.append("drop_5h"); _notify("Claude Code: cota 5h liberou ⬇️", f"Uso caiu de {p_spct}% para {s_pct}%", "Ping", notify)
-        if w_re and p_wre and w_re - p_wre > RESET_TOLERANCE:
-            events.append("reset_week"); _notify("Claude Code: SEMANAL resetou ✅", f"Nova janela. Próximo reset: {w_reset}", "Submarine", notify)
-        elif w_pct is not None and p_wpct is not None and w_pct < p_wpct - DROP_THRESHOLD:
-            events.append("drop_week"); _notify("Claude Code: cota SEMANAL liberou ⬇️", f"Uso caiu de {p_wpct}% para {w_pct}%", "Submarine", notify)
+        for key, lbl, sound, pct, p_pct, rep, p_rep, reset_txt in (
+            ("5h", "5h", "Ping", s_pct, p_spct, s_re, p_sre, s_reset),
+            ("week", "SEMANAL", "Submarine", w_pct, p_wpct, w_re, p_wre, w_reset),
+        ):
+            if rep and p_rep and rep - p_rep > RESET_TOLERANCE:
+                events.append(f"reset_{key}")
+                _notify(f"Claude Code: {lbl} resetou ✅", f"Nova janela. Próximo reset: {reset_txt}", sound, notify)
+            elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
+                events.append(f"drop_{key}")
+                _notify(f"Claude Code: cota {lbl} liberou ⬇️", f"Uso caiu de {p_pct}% para {pct}%", sound, notify)
 
         # (1) janela 5h ATINGIU 100% (transição <100 -> 100)
         if s_pct is not None and s_pct >= CREDIT_PCT and p_spct is not None and p_spct < CREDIT_PCT:
@@ -661,11 +767,7 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
             "SELECT MIN(ts_epoch) FROM meter WHERE session_pct >= ? AND ts_epoch > ? AND ts_epoch <= ?",
             (CREDIT_PCT, last_below, now.timestamp()),
         ).fetchone()[0] or now.timestamp()
-        tok = con.execute(
-            "SELECT COALESCE(SUM(output_tokens),0) FROM usage "
-            "WHERE ts_epoch > ? AND ts_epoch <= ? AND model LIKE 'claude%'",
-            (cap_start, now.timestamp()),
-        ).fetchone()[0]
+        tok = _real_output_tokens(con, cap_start, now.timestamp())
         already = con.execute(
             "SELECT COUNT(*) FROM meter WHERE ts_epoch > ? AND event LIKE '%credits_started%'",
             (cap_start,),
@@ -728,16 +830,14 @@ def bursts_report(con: sqlite3.Connection, args) -> None:
     tz = ZoneInfo(METER_TZ) if (ZoneInfo and not args.utc) else timezone.utc
     tzname = "local" if not args.utc else "UTC"
     gap = args.gap
-    billing = dict(con.execute("SELECT uuid, billing_source FROM usage"))
+    # só os uuids em crédito (raros) — evita carregar a tabela usage inteira
+    credit_uuids = {r[0] for r in con.execute(
+        "SELECT uuid FROM usage WHERE billing_source='credits'")}
 
     msgs, triggers, banners = [], [], []
     sess = args.session
     for jf in PROJECTS_DIR.rglob("*.jsonl"):
-        try:
-            fh = open(jf, errors="replace")
-        except OSError:
-            continue
-        for line in fh:
+        for line in _iter_lines(jf):
             if sess and sess not in line:
                 continue
             try:
@@ -752,7 +852,6 @@ def bursts_report(con: sqlite3.Connection, args) -> None:
             typ = o.get("type")
             m = o.get("message", {})
             if typ == "assistant" and isinstance(m, dict):
-                u = m.get("usage") or {}
                 txt = _join_text(m.get("content"))
                 is_cap = bool(LIMIT_PATTERNS.search(txt)) if txt else False
                 has_wake = any(isinstance(b, dict) and b.get("type") == "tool_use"
@@ -760,9 +859,7 @@ def bursts_report(con: sqlite3.Connection, args) -> None:
                                for b in (m.get("content") or []))
                 msgs.append({
                     "te": te, "uuid": o.get("uuid"), "model": m.get("model"),
-                    "in": int(u.get("input_tokens", 0) or 0), "out": int(u.get("output_tokens", 0) or 0),
-                    "cr": int(u.get("cache_read_input_tokens", 0) or 0),
-                    "cw": int(u.get("cache_creation_input_tokens", 0) or 0),
+                    **_usage_tokens(m.get("usage") or {}),
                     "side": bool(o.get("isSidechain")), "ent": o.get("entrypoint"),
                     "cap": is_cap, "wake": has_wake,
                 })
@@ -789,20 +886,21 @@ def bursts_report(con: sqlite3.Connection, args) -> None:
     def lt(e, fmt="%d/%m %H:%M:%S"):
         return datetime.fromtimestamp(e, tz).strftime(fmt)
 
+    def _usd(x):
+        return cost(x["model"], _cost_row(x))
+
     print(f"\n=== BURSTS — session={sess or 'TODAS'} — gap>{gap // 60}min — horário {tzname} ===\n")
     for i, g in enumerate(groups, 1):
         a, z = g[0]["te"], g[-1]["te"]
         dur = int((z - a) / 60)
-        real = [x for x in g if x["model"] and x["model"].startswith("claude")]
+        real = [x for x in g if is_real_model(x["model"])]
         synth = len(g) - len(real)
         side = sum(1 for x in g if x["side"])
         models = collections.Counter(x["model"] for x in real)
         ti = sum(x["in"] for x in g); to = sum(x["out"] for x in g)
         tcr = sum(x["cr"] for x in g); tcw = sum(x["cw"] for x in g)
-        def _usd(x):
-            return cost(x["model"] or "_default", {"in": x["in"], "out": x["out"], "cread": x["cr"], "cwrite": x["cw"]})
         usd = sum(_usd(x) for x in g)
-        cred_msgs = [x for x in real if billing.get(x["uuid"]) == "credits"]
+        cred_msgs = [x for x in real if x["uuid"] in credit_uuids]
         cred = len(cred_msgs)
         usd_cred = sum(_usd(x) for x in cred_msgs)
         usd_sub = usd - usd_cred
@@ -848,8 +946,8 @@ def _episode_tokens(con: sqlite3.Connection, a: float, b: float) -> dict:
     """Soma tokens por modelo numa janela [a,b] (epoch). {model: {in,out,cr,cw}}."""
     out = {}
     for m, i, o, cr, cw in con.execute(
-        "SELECT model, SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write) "
-        "FROM usage WHERE ts_epoch > ? AND ts_epoch <= ? AND model LIKE 'claude%' GROUP BY model",
+        f"SELECT model, SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write) "
+        f"FROM usage WHERE ts_epoch > ? AND ts_epoch <= ? AND {REAL_MODEL_SQL} GROUP BY model",
         (a, b),
     ):
         out[m] = {"in": i or 0, "out": o or 0, "cr": cr or 0, "cw": cw or 0}
@@ -897,9 +995,7 @@ def calibrate(con: sqlite3.Connection, args) -> None:
         A, b = [], []
         for usd, tj in eps:
             toks = json.loads(tj)
-            row = [base_cost(m, {"in": toks.get(m, {}).get("in", 0), "out": toks.get(m, {}).get("out", 0),
-                                 "cread": toks.get(m, {}).get("cr", 0), "cwrite": toks.get(m, {}).get("cw", 0)})
-                   for m in models]
+            row = [base_cost(m, _cost_row(toks.get(m, {}))) for m in models]
             A.append(row); b.append(usd)
         lam = max(1e-6, 0.02 * max((A[r][c] for r in range(len(A)) for c in range(len(models))), default=1.0))
         f = _solve_ridge(A, b, len(models), lam)
@@ -944,28 +1040,42 @@ def calibrate(con: sqlite3.Connection, args) -> None:
                  datetime.fromtimestamp(a, timezone.utc).isoformat(),
                  datetime.fromtimestamp(b, timezone.utc).isoformat(), json.dumps(toks)))
     con.commit()
-    est = sum(base_cost(m, {"in": t["in"], "out": t["out"], "cread": t["cr"], "cwrite": t["cw"]}) for m, t in toks.items())
+    est = sum(base_cost(m, _cost_row(t)) for m, t in toks.items())
     print(f"\n✅ episódio registrado: US${real_usd:.2f} real  vs  US${est:.2f} nominal  (modelos: {', '.join(toks)})")
     print("   rode `calibrate --solve` para recalcular os fatores (e --apply p/ gravar)\n")
 
 
 # ----------------------------- CLI ----------------------------------------- #
+def _watch_loop(label: str, interval: int, step) -> None:
+    print(f"{label} a cada {interval}s (Ctrl-C para sair)")
+    try:
+        while True:
+            step()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print("\nencerrado.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Monitor de uso de tokens do Claude Code")
     sub = ap.add_subparsers(dest="cmd", required=True)
+    # comandos que leem o banco herdam --no-ingest (pula a atualização prévia)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--no-ingest", action="store_true", help="não atualizar o banco antes")
 
     sub.add_parser("ingest", help="varre os .jsonl e popula o banco")
 
-    rp = sub.add_parser("report", help="relatório agregado")
+    rp = sub.add_parser("report", help="relatório agregado", parents=[common])
     rp.add_argument("--window", choices=list(WINDOWS), default="week")
     rp.add_argument("--since", help="data ISO (YYYY-MM-DD); sobrepõe --window")
     rp.add_argument("--by", choices=["model", "session", "project", "day", "billing", "none"], default="none")
     rp.add_argument("--model", help="filtra por model exato (ex.: claude-fable-5)")
     rp.add_argument("--session", help="filtra por prefixo de session_id (ex.: 86e5a22d)")
     rp.add_argument("--project", help="filtra por substring do projeto (ex.: GATSO ou wf_)")
-    rp.add_argument("--no-ingest", action="store_true", help="não atualizar o banco antes")
+    rp.add_argument("--io-only", dest="io_only", action="store_true",
+                    help="só in/out + %% de output, sem cache/custo (comparável ao app do Claude)")
 
-    lp = sub.add_parser("limits", help="lista batidas de limite")
+    lp = sub.add_parser("limits", help="lista batidas de limite", parents=[common])
     lp.add_argument("--limit", type=int, default=50)
 
     wp = sub.add_parser("watch", help="ingest contínuo")
@@ -979,7 +1089,8 @@ def main() -> None:
     mr = sub.add_parser("meter-report", help="histórico do medidor oficial")
     mr.add_argument("--limit", type=int, default=30)
 
-    cp = sub.add_parser("calibrate", help="aprende fator de preço por modelo a partir de gastos reais de crédito")
+    cp = sub.add_parser("calibrate", help="aprende fator de preço por modelo a partir de gastos reais de crédito",
+                        parents=[common])
     cp.add_argument("--brl", type=float, help="gasto real em R$ (converte por --rate)")
     cp.add_argument("--usd", type=float, help="gasto real em US$ (tem precedência sobre --brl)")
     cp.add_argument("--rate", type=float, default=5.9, help="câmbio US$/R$ (default 5.9)")
@@ -990,53 +1101,41 @@ def main() -> None:
     cp.add_argument("--solve", action="store_true", help="resolve os fatores por modelo (mínimos quadrados)")
     cp.add_argument("--apply", action="store_true", help="grava os fatores resolvidos (com --solve)")
 
-    bp = sub.add_parser("bursts", help="detalha clusters de atividade (gatilho, billing, modelos, cap)")
+    bp = sub.add_parser("bursts", help="detalha clusters de atividade (gatilho, billing, modelos, cap)",
+                        parents=[common])
     bp.add_argument("--session", help="prefixo do session_id (vazio = todas)")
     bp.add_argument("--gap", type=int, default=1200, help="segundos de inatividade que separam bursts (default 1200=20min)")
     bp.add_argument("--utc", action="store_true", help="exibir em UTC (default: horário local METER_TZ)")
-    bp.add_argument("--no-ingest", action="store_true")
 
     args = ap.parse_args()
     con = db_connect()
 
+    # ingest prévio centralizado: report/limits/bursts sempre; calibrate só ao
+    # registrar episódio (--list/--solve não dependem de dados novos)
+    wants_ingest = args.cmd in ("report", "limits", "bursts") or (
+        args.cmd == "calibrate" and not (args.list or args.solve))
+    if wants_ingest and not args.no_ingest:
+        ingest(con, verbose=False)
+
     if args.cmd == "ingest":
         ingest(con)
     elif args.cmd == "report":
-        if not getattr(args, "no_ingest", False):
-            ingest(con, verbose=False)
         report(con, args)
     elif args.cmd == "limits":
-        ingest(con, verbose=False)
         limits(con, args)
     elif args.cmd == "watch":
-        print(f"watch: ingest a cada {args.interval}s (Ctrl-C para sair)")
-        try:
-            while True:
-                ingest(con)
-                time.sleep(args.interval)
-        except KeyboardInterrupt:
-            print("\nencerrado.")
+        _watch_loop("watch: ingest", args.interval, lambda: ingest(con))
     elif args.cmd == "meter":
         notify = not args.no_notify
         if args.watch:
-            print(f"meter: /usage a cada {args.interval}s (Ctrl-C para sair)")
-            try:
-                while True:
-                    meter_once(con, notify=notify)
-                    time.sleep(args.interval)
-            except KeyboardInterrupt:
-                print("\nencerrado.")
+            _watch_loop("meter: /usage", args.interval, lambda: meter_once(con, notify=notify))
         else:
             meter_once(con, notify=notify)
     elif args.cmd == "meter-report":
         meter_report(con, args)
     elif args.cmd == "bursts":
-        if not getattr(args, "no_ingest", False):
-            ingest(con, verbose=False)
         bursts_report(con, args)
     elif args.cmd == "calibrate":
-        if not (args.list or args.solve):
-            ingest(con, verbose=False)
         calibrate(con, args)
     con.close()
 
