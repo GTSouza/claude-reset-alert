@@ -561,7 +561,10 @@ def report(con: sqlite3.Connection, args) -> None:
     # por modelo. agg[grupo] = {in,out,cread,cwrite,msgs,usd}
     agg: dict[str, dict] = {}
     for g, model, i, o, cr, cw, ws, wf, n in subrows:
-        key = (str(g)[:32]) if g else "?"
+        # chave de agregação COMPLETA: truncar aqui fundiria session_ids (UUID 36c) ou
+        # projetos (caminho longo com prefixo comum) que partilham os 1ºs 32 chars,
+        # somando grupos distintos. O truncamento p/ caber na coluna é só na exibição.
+        key = str(g) if g else "?"
         d = agg.setdefault(key, {"in": 0, "out": 0, "cread": 0, "cwrite": 0, "msgs": 0, "usd": 0.0})
         d["usd"] += cost(model, {"in": i, "out": o, "cread": cr, "cwrite": cw})
         d["in"] += i; d["out"] += o; d["cread"] += cr; d["cwrite"] += cw; d["msgs"] += n
@@ -577,7 +580,7 @@ def report(con: sqlite3.Connection, args) -> None:
         print("-" * len(header))
         tot = {"in": 0, "out": 0, "msgs": 0}
         for g_disp, d in ordered:
-            print(f"{g_disp:<34} {fmt(d['in']):>12} {fmt(d['out']):>12} {d['out'] / tot_out * 100:>6.1f}% {d['msgs']:>6}")
+            print(f"{g_disp[:34]:<34} {fmt(d['in']):>12} {fmt(d['out']):>12} {d['out'] / tot_out * 100:>6.1f}% {d['msgs']:>6}")
             for k in tot:
                 tot[k] += d[k]
         print("-" * len(header))
@@ -592,7 +595,7 @@ def report(con: sqlite3.Connection, args) -> None:
     print("-" * len(header))
     tot = {"in": 0, "out": 0, "cread": 0, "cwrite": 0, "msgs": 0, "usd": 0.0}
     for g_disp, d in ordered:
-        print(f"{g_disp:<34} {fmt(d['in']):>12} {fmt(d['out']):>12} {fmt(d['cread']):>13} {fmt(d['cwrite']):>12} {d['msgs']:>6} {d['usd']:>9.2f}")
+        print(f"{g_disp[:34]:<34} {fmt(d['in']):>12} {fmt(d['out']):>12} {fmt(d['cread']):>13} {fmt(d['cwrite']):>12} {d['msgs']:>6} {d['usd']:>9.2f}")
         for k in tot:
             tot[k] += d[k]
     print("-" * len(header))
