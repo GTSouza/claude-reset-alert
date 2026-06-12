@@ -133,8 +133,17 @@ fetch_usage() {
 # O texto vem do modelo e arredonda os minutos a cada poll (3pm <-> 2:59pm),
 # então comparamos instantes com tolerância em vez de comparar strings.
 # Devolve vazio (e código !=0) se não conseguir interpretar.
+# "mon day year HH MM AMPM" -> epoch, cobrindo GNU date (Linux) e BSD date (macOS).
+_epoch_ymd() { # mon day year HH MM AMPM
+  if date --version >/dev/null 2>&1; then          # GNU date (Linux)
+    date -d "$1 $2 $3 $4:$5 $6" +%s 2>/dev/null
+  else                                             # BSD date (macOS)
+    date -j -f "%b %d %Y %I:%M %p" "$1 $2 $3 $4:$5 $6" +%s 2>/dev/null
+  fi
+}
+
 reset_to_epoch() { # "Mon DD at H[:MM]am/pm (tz)"
-  local s="$1" mon day tm ampm hh mm year norm
+  local s="$1" mon day tm ampm hh mm year e
   s="${s%% (*}"                                   # remove " (timezone)"
   s="$(printf '%s' "$s" | tr -s ' ')"
   mon="$(printf '%s' "$s" | awk '{print $1}')"
@@ -144,15 +153,18 @@ reset_to_epoch() { # "Mon DD at H[:MM]am/pm (tz)"
   ampm="$(printf '%s' "$tm" | grep -oiE '[ap]m$' | tr '[:lower:]' '[:upper:]')"
   tm="$(printf '%s' "$tm" | sed -E 's/[aApP][mM]$//')"
   if [[ "$tm" == *:* ]]; then hh="${tm%%:*}"; mm="${tm#*:}"; else hh="$tm"; mm="00"; fi
-  printf -v hh '%02d' "$hh" 2>/dev/null || return 1
-  printf -v mm '%02d' "$mm" 2>/dev/null || return 1
+  [[ "$hh" =~ ^[0-9]+$ && "$mm" =~ ^[0-9]+$ ]] || return 1
+  # base decimal explícita: sem isso bash lê '08'/'09' como octal inválido e aborta.
+  hh=$((10#$hh)); mm=$((10#$mm))
+  printf -v hh '%02d' "$hh"; printf -v mm '%02d' "$mm"
   year="$(date +%Y)"
-  norm="$mon $day $year $hh:$mm $ampm"
-  if date --version >/dev/null 2>&1; then          # GNU date (Linux)
-    date -d "$mon $day $year $hh:$mm $ampm" +%s 2>/dev/null
-  else                                             # BSD date (macOS)
-    date -j -f "%b %d %Y %I:%M %p" "$norm" +%s 2>/dev/null
+  e="$(_epoch_ymd "$mon" "$day" "$year" "$hh" "$mm" "$ampm")"
+  # /usage só reporta resets FUTUROS; se o ano corrente jogou a data >1 dia no
+  # passado (reset de janeiro lido em dezembro), é do ano seguinte.
+  if [[ -n "$e" ]] && (( e < $(date +%s) - 86400 )); then
+    e="$(_epoch_ymd "$mon" "$day" "$((year + 1))" "$hh" "$mm" "$ampm")"
   fi
+  [[ -n "$e" ]] && printf '%s' "$e"
 }
 
 # Extrai "<percent>|<reset>" de uma linha do /usage que comece com $2.
