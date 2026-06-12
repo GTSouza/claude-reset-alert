@@ -99,6 +99,7 @@ TG_ENV_FILE = Path(os.environ.get("TG_ENV_FILE", str(Path.home() / ".claude" / "
 PRICING = {
     "claude-fable-5":         {"in": 10.0, "out": 50.0, "cache_read": 1.00, "cache_write": 12.50},
     "claude-opus-4-8":        {"in": 5.0,  "out": 25.0, "cache_read": 0.50, "cache_write": 6.25},
+    "claude-opus-4-7":        {"in": 5.0,  "out": 25.0, "cache_read": 0.50, "cache_write": 6.25},
     "claude-sonnet-4-6":      {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75},
     "claude-haiku-4-5":       {"in": 1.0,  "out": 5.0,  "cache_read": 0.10, "cache_write": 1.25},
     "_default":               {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75},
@@ -106,8 +107,11 @@ PRICING = {
 
 
 def _norm_model(model: str | None) -> str:
-    """Variantes como 'claude-fable-5[1m]' compartilham preço/fator com o modelo base."""
-    return (model or "_default").split("[")[0]
+    """Normaliza variantes ao modelo base p/ compartilhar preço/fator: o sufixo '[1m]'
+    e o sufixo DATADO '-YYYYMMDD' que o Claude Code grava de verdade nos transcripts
+    (ex.: 'claude-haiku-4-5-20251001' -> 'claude-haiku-4-5'). Sem isso o ID datado não
+    casa PRICING e cairia no _default (~3× o preço do haiku)."""
+    return re.sub(r"-\d{8}$", "", (model or "_default").split("[")[0])
 
 # Fatores por modelo (base × fator = custo real), persistidos em JSON e aprendidos
 # via `calibrate`. Carregados uma vez; default 1.0 para modelo sem calibração.
