@@ -725,7 +725,14 @@ def _reset_to_epoch(s: str | None) -> float | None:
     hh = int(hh) % 12 + (12 if ap.lower() == "pm" else 0)
     mm = int(mm) if mm else 0
     try:
-        dt = datetime(datetime.now(timezone.utc).year, mon_n, int(day), hh, mm, tzinfo=ZoneInfo(METER_TZ))
+        tz = ZoneInfo(METER_TZ)
+        now_local = datetime.now(tz)
+        dt = datetime(now_local.year, mon_n, int(day), hh, mm, tzinfo=tz)
+        # O /usage só reporta resets FUTUROS. Se ancorar no ano corrente jogou a data
+        # para o passado (reset de janeiro lido em dezembro), é do ano seguinte — senão
+        # a virada de ano produziria um salto de ~1 ano no epoch e um reset espúrio.
+        if dt < now_local - timedelta(hours=12):
+            dt = dt.replace(year=dt.year + 1)
         return dt.timestamp()
     except Exception:
         return None
