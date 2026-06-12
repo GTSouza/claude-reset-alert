@@ -188,13 +188,22 @@ function Reset-ToDateTime($reset) {
   if (-not $reset) { return $null }
   $s = ($reset -replace '\s*\(.*\)\s*$', '').Trim()   # remove " (timezone)"
   $s = $s -replace '\s+at\s+', ' '                     # "Jun 10 at 3pm" -> "Jun 10 3pm"
-  if ($s -notmatch '(?i)\d(am|pm)$') { $s = $s -replace '(?i)(\d)(am|pm)$', '$1:00$2' }
+  # Insere ':00' só quando NÃO há minutos. A condição tem que testar a presença de
+  # MINUTOS (\d:\d{2}), não de am/pm: todo horário termina em dígito+am/pm, então
+  # '\d(am|pm)$' casaria sempre e o ':00' nunca seria inserido — 'Jun 10 3pm' (hora
+  # cheia) jamais viraria '3:00pm', falhava o parse e disparava reset falso.
+  if ($s -notmatch '(?i)\d:\d{2}(am|pm)$') { $s = $s -replace '(?i)(\d)(am|pm)$', '$1:00$2' }
   $s = "$s $((Get-Date).Year)"
   $fmts = @('MMM d h:mmtt yyyy','MMM dd h:mmtt yyyy','MMM d hh:mmtt yyyy','MMM dd hh:mmtt yyyy')
   $ci = [System.Globalization.CultureInfo]::InvariantCulture
   $dt = [datetime]::MinValue
   foreach ($f in $fmts) {
-    if ([datetime]::TryParseExact($s, $f, $ci, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return $dt }
+    if ([datetime]::TryParseExact($s, $f, $ci, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) {
+      # /usage só reporta resets futuros; reset de janeiro lido em dezembro recebe o
+      # ano corrente e cai no passado — nesse caso é do ano seguinte.
+      if ($dt -lt (Get-Date).AddDays(-1)) { $dt = $dt.AddYears(1) }
+      return $dt
+    }
   }
   return $null
 }
