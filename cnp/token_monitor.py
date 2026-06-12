@@ -374,6 +374,7 @@ def credit_episodes(con: sqlite3.Connection) -> list[tuple[float, float]]:
     ).fetchall()
     if not meters:
         return []
+    now = datetime.now(timezone.utc).timestamp()
     episodes = []
     i, n = 0, len(meters)
     while i < n:
@@ -382,12 +383,17 @@ def credit_episodes(con: sqlite3.Connection) -> list[tuple[float, float]]:
             j = i
             while j < n and meters[j][1] >= CREDIT_PCT:    # fim do streak de 100%
                 j += 1
-            # Termina na ÚLTIMA leitura 100% confirmada — NÃO na 1ª <100%. O reset real
-            # cai dentro do gap de poll (last_100 -> first_<100); ir até first_<100
-            # pescaria trabalho PÓS-reset (assinatura nova). Conservador e correto.
-            cap_end = meters[j - 1][0]
+            last_100 = meters[j - 1][0]                    # última leitura 100% confirmada
+            # O reset real cai no gap de poll entre a última 100% e a 1ª <100%. Estimamos
+            # no PONTO MÉDIO (esperança do instante do reset): truncar em last_100
+            # subnotifica até 1 intervalo de poll de crédito, e ir até a 1ª <100% pescaria
+            # trabalho pós-reset (assinatura). O ponto médio é simétrico e — crucial —
+            # dá intervalo NÃO-degenerado mesmo num streak de 1 leitura (senão (x, x]
+            # seria vazio e zeraria o crédito). Ainda capado (sem <100% depois) =>
+            # credita até agora.
+            cap_end = (last_100 + meters[j][0]) / 2.0 if j < n else now
             # só é crédito se houve token real ESTRITAMENTE após o 100% confirmado
-            if _real_output_tokens(con, cap_start, cap_end) > 0:
+            if cap_end > cap_start and _real_output_tokens(con, cap_start, cap_end) > 0:
                 episodes.append((cap_start, cap_end))
             i = j
         else:
