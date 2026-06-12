@@ -849,7 +849,9 @@ def gate(con: sqlite3.Connection, args) -> int:
         # leitura velha/ausente → busca ao vivo (custo zero de cota) e relê o banco
         meter_once(con, notify=not args.no_notify)
         row = _latest_meter(con)
-        age = (now - row[0]) if row else None
+        # a leitura acabou de ser gravada (ts > now capturado acima); age = 0 (não
+        # negativo, que vazaria como age_seconds < 0 no --json).
+        age = 0.0 if row else None
         refreshed = True
 
     if not row or row[1] is None or row[3] is None:
@@ -1118,7 +1120,8 @@ def calibrate(con: sqlite3.Connection, args) -> None:
             print(f"  {m:<22} fator={factors[m]:.3f}   peso nos dados={lev[m]/totlev*100:4.1f}%  confiança={conf}")
         for r, (usd, tj) in enumerate(eps):
             est = sum(A[r][i] * factors[models[i]] for i in range(len(models)))
-            print(f"  · episódio {r+1}: estimado US${est:.2f} vs real US${usd:.2f}  (erro {abs(est-usd)/usd*100:.1f}%)")
+            err = abs(est - usd) / usd * 100 if usd else float("nan")
+            print(f"  · episódio {r+1}: estimado US${est:.2f} vs real US${usd:.2f}  (erro {err:.1f}%)")
         if args.apply:
             FACTORS_PATH.write_text(json.dumps(factors, indent=2))
             print(f"\n✅ aplicado em {FACTORS_PATH}")
