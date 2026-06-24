@@ -333,6 +333,17 @@ O rollout é um **snapshot da última vez que o Codex rodou** — não se atuali
 - **Inferência de reset (no gate):** como `resets_at` é epoch absoluto, uma janela cujo reset já passou é tratada como recuperada (~0%) mesmo sem o Codex rodar. Sem isso, um `gate --provider codex` ficaria preso no % antigo para sempre e um runner gated em Codex nunca acordaria.
 - **Confirmação ao vivo (`codex-meter --refresh`):** gasta **1 turno mínimo** do `codex exec` para obter o número real, mas **só quando um reset já cruzou desde o rollout** (antes disso a leitura ainda é válida, pois sem o Codex rodar o uso não muda). `--force` gasta sempre. Use fora de um loop ativo quando quiser confirmar o reset em vez de só inferir.
 
+#### Uso de tokens (`codex-report`)
+
+O `ingest` também varre os rollouts e grava o uso de tokens por sessão na tabela `codex_usage` (total cumulativo do último `token_count` + janela de tempo 1º→último evento + modelo). `codex-report` agrega isso por sessão/dia/modelo. Codex é assinatura, então reporta **tokens e tempo**, não custo por token.
+
+```bash
+~/.claude/tools/token_monitor.py ingest                      # popula codex_usage (além de usage/meter)
+~/.claude/tools/token_monitor.py codex-report --by session   # tokens + tempo por sessão
+~/.claude/tools/token_monitor.py codex-report --by day       # por dia
+~/.claude/tools/token_monitor.py codex-report --by model     # por modelo
+```
+
 #### `meter` agora inclui o Codex
 
 `meter` (a leitura do `/usage` do Claude) também mede o Codex por padrão, quando há rollouts — inclusive em `meter --watch`. A linha do Claude (`5h: N% usado · reset ...`, que o `ingest`/`watch.log` parseia) **fica inalterada**.
