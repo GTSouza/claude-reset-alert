@@ -908,7 +908,14 @@ def _fmt_epoch(epoch) -> str | None:
     if not epoch:
         return None
     try:
-        return datetime.fromtimestamp(float(epoch)).strftime("%b %d %H:%M")
+        if ZoneInfo:
+            tz, tzname = ZoneInfo(METER_TZ), METER_TZ
+        else:
+            tz, tzname = timezone.utc, "UTC"
+        dt = datetime.fromtimestamp(float(epoch), tz)
+        # mesmo padrão da linha do Claude: "Jun 24 at 9:39pm (America/Sao_Paulo)"
+        return (dt.strftime("%b %-d at %-I:%M%p").replace("AM", "am").replace("PM", "pm")
+                + f" ({tzname})")
     except Exception:
         return str(epoch)
 
@@ -1115,8 +1122,8 @@ def codex_meter_once(con: sqlite3.Connection, notify: bool = True, as_json: bool
                           "week_pct": w_pct, "week_reset": w_reset,
                           "event": ",".join(events) or None}, ensure_ascii=False))
     else:
-        print(f"📊 [codex/{m['plan']}] 5h: {_pctstr(s_pct)} · reset {s_reset}  |  "
-              f"semanal: {_pctstr(w_pct)} · reset {w_reset}  (rollout {age}s)"
+        print(f"📊 codex 5h: {_pctstr(s_pct)} usado · reset {s_reset}  |  "
+              f"semanal: {_pctstr(w_pct)} usado · reset {w_reset}  (rollout {age}s, {m['plan']})"
               + (f"  evento: {','.join(events)}" if events else ""))
     return True
 
@@ -1736,8 +1743,8 @@ def main() -> None:
                 need, why = _codex_refresh_needed(m0, getattr(args, "force", False))
                 if need:
                     print(f"… confirmando ao vivo (codex exec, turno mínimo): {why}")
-                    status, _ = codex_live_refresh()
-                    print(f"  codex exec: {status}")
+                    st, _ = codex_live_refresh()
+                    print(f"  codex exec: {st}")
                 else:
                     age = int(datetime.now(timezone.utc).timestamp() - m0["ts_epoch"]) if m0 and m0.get("ts_epoch") else 0
                     print(f"  leitura ainda válida (rollout {age}s, nenhum reset cruzado desde então) — sem gasto de cota; use --force para forçar")
