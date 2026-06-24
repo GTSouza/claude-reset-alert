@@ -29,6 +29,7 @@ Uso — medidor oficial (porte do claude-limit-watch.sh, custo zero) + Codex (ro
   python3 token_monitor.py meter --no-codex   # só Claude (por padrão mede o Codex junto, se houver rollouts)
   python3 token_monitor.py codex-meter        # 1 leitura do rate-limit do Codex (rollouts ~/.codex/sessions)
   python3 token_monitor.py codex-meter --watch --interval 300   # loop; alerta reset/drop/cap (5h/semanal)
+  python3 token_monitor.py codex-meter --refresh   # confirma ao vivo (1 turno mínimo do codex exec) só se um reset cruzou; --force sempre
   python3 token_monitor.py codex-meter-report # histórico do medidor do Codex
   python3 token_monitor.py status             # resumo num olhar: Claude + Codex + veredito do gate(both)
   python3 token_monitor.py gate --provider both   # PAUSE se Claude OU Codex estourar (default --provider claude)
@@ -941,6 +942,44 @@ def read_codex_meter(scan_files: int = 8):
     return best
 
 
+def codex_live_refresh(timeout: int = 120):
+    """Gasta UM turno MÍNIMO do `codex exec` para forçar um rollout novo com os
+    rate_limits atuais. O CLI do Codex não expõe fetch de uso sem turno (o /status da
+    TUI só remostra o último valor recebido), então um turno trivial é a forma mais
+    barata de obter um número fresco fora de um loop ativo. Retorna (status, leitura)."""
+    if not shutil.which("codex"):
+        return ("codex ausente no PATH", None)
+    try:
+        r = subprocess.run(
+            ["codex", "exec", "--sandbox", "read-only", "-C", os.path.expanduser("~"),
+             "Não use ferramentas. Responda somente com: ok"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        status = "ok" if r.returncode == 0 else f"exit {r.returncode}"
+    except subprocess.TimeoutExpired:
+        status = f"timeout {timeout}s"
+    except Exception as e:  # noqa: BLE001
+        status = f"erro: {e}"
+    return (status, read_codex_meter())
+
+
+def _codex_refresh_needed(m, force: bool = False):
+    """Vale gastar o turno? Só quando um reset já cruzou desde o último rollout (a
+    leitura ficou velha de verdade) ou quando forçado. Antes do reset a leitura ainda é
+    válida (se o Codex não rodou, o uso não mudou), então não há o que confirmar."""
+    if force:
+        return True, "forçado (--force)"
+    if not m or m.get("session_pct") is None:
+        return True, "sem rollout com rate_limits"
+    now = datetime.now(timezone.utc).timestamp()
+    ts = m.get("ts_epoch")
+    for label, key in (("5h", "session_reset_epoch"), ("semanal", "week_reset_epoch")):
+        re = m.get(key)
+        if re and ts and now >= re > ts:
+            return True, f"reset {label} já cruzou desde o rollout"
+    return False, ""
+
+
 def codex_meter_once(con: sqlite3.Connection, notify: bool = True, as_json: bool = False) -> bool:
     """Uma leitura do rate-limit do Codex: grava na tabela codex_meter e dispara
     notificação de reset/queda/cap (mesma lógica do meter_once do Claude)."""
@@ -1462,6 +1501,10 @@ def main() -> None:
     cm.add_argument("--interval", type=int, default=300)
     cm.add_argument("--no-notify", action="store_true", help="não notificar (macOS/Telegram)")
     cm.add_argument("--json", action="store_true", help="saída JSON")
+    cm.add_argument("--refresh", action="store_true",
+                    help="confirma ao vivo com 1 turno MÍNIMO do codex exec, mas só se um reset já cruzou desde o rollout (custo mínimo)")
+    cm.add_argument("--force", action="store_true",
+                    help="com --refresh, gasta o turno sempre (mesmo sem reset cruzado)")
 
     cmr = sub.add_parser("codex-meter-report", help="histórico do medidor Codex (tabela codex_meter)")
     cmr.add_argument("--limit", type=int, default=30)
@@ -1536,6 +1579,16 @@ def main() -> None:
         if args.watch:
             _watch_loop("codex-meter", args.interval, lambda: codex_meter_once(con, notify=notify))
         else:
+            if getattr(args, "refresh", False):
+                m0 = read_codex_meter()
+                need, why = _codex_refresh_needed(m0, getattr(args, "force", False))
+                if need:
+                    print(f"… confirmando ao vivo (codex exec, turno mínimo): {why}")
+                    status, _ = codex_live_refresh()
+                    print(f"  codex exec: {status}")
+                else:
+                    age = int(datetime.now(timezone.utc).timestamp() - m0["ts_epoch"]) if m0 and m0.get("ts_epoch") else 0
+                    print(f"  leitura ainda válida (rollout {age}s, nenhum reset cruzado desde então) — sem gasto de cota; use --force para forçar")
             codex_meter_once(con, notify=notify, as_json=args.json)
     elif args.cmd == "codex-meter-report":
         codex_meter_report(con, args)
