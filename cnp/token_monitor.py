@@ -1036,10 +1036,22 @@ def _codex_reading(args) -> dict:
     if not m or m.get("session_pct") is None:
         return {"label": "codex", "session_pct": None, "session_reset": None,
                 "week_pct": None, "week_reset": None, "source": "sem leitura", "refreshed": False}
-    age = max(0, int(datetime.now(timezone.utc).timestamp() - m["ts_epoch"]))
-    return {"label": "codex", "session_pct": m["session_pct"], "session_reset": _fmt_epoch(m["session_reset_epoch"]),
-            "week_pct": m["week_pct"], "week_reset": _fmt_epoch(m["week_reset_epoch"]),
-            "source": f"rollout {age}s", "refreshed": False}
+    now = datetime.now(timezone.utc).timestamp()
+    # O rollout do Codex é um snapshot estático da última vez que ele rodou; NÃO se
+    # atualiza sozinho. Mas resets_at é epoch absoluto, então uma janela cujo reset já
+    # passou está recuperada (~0%) mesmo sem o Codex rodar de novo. Sem isto o gate
+    # ficaria preso no % antigo para sempre e um runner gated em codex nunca acordaria.
+    s_pct, w_pct = m["session_pct"], m["week_pct"]
+    s_re, w_re = m.get("session_reset_epoch"), m.get("week_reset_epoch")
+    note = ""
+    if s_re and now >= s_re:
+        s_pct = 0.0; note += " · 5h resetou"
+    if w_re and now >= w_re:
+        w_pct = 0.0; note += " · semanal resetou"
+    age = max(0, int(now - m["ts_epoch"])) if m.get("ts_epoch") else 0
+    return {"label": "codex", "session_pct": s_pct, "session_reset": _fmt_epoch(s_re),
+            "week_pct": w_pct, "week_reset": _fmt_epoch(w_re),
+            "source": f"rollout {age}s{note}", "refreshed": False}
 
 
 def gate(con: sqlite3.Connection, args) -> int:
@@ -1398,12 +1410,12 @@ def status(con: sqlite3.Connection, args) -> None:
     else:
         print("📊 Claude   (sem leitura — rode: token_monitor.py meter)")
     if cm and cm.get("session_pct") is not None:
-        sp = cm["session_pct"]; wp = cm["week_pct"]
+        rd = _codex_reading(args)              # mesma inferência de reset do gate
+        sp = rd["session_pct"]; wp = rd["week_pct"]
         if sp >= g5 or wp >= gw: pauses.append("codex")
         flag = "  🛑" if "codex" in pauses else ""
-        age = max(0, int(datetime.now(timezone.utc).timestamp() - cm["ts_epoch"]))
-        print(f"📊 Codex    5h: {_pctstr(sp)} · reset {_fmt_epoch(cm['session_reset_epoch'])}   |   "
-              f"semanal: {_pctstr(wp)} · reset {_fmt_epoch(cm['week_reset_epoch'])}{flag}   [{cm['plan']}, {age}s]")
+        print(f"📊 Codex    5h: {_pctstr(sp)} · reset {rd['session_reset']}   |   "
+              f"semanal: {_pctstr(wp)} · reset {rd['week_reset']}{flag}   [{cm['plan']}, {rd['source']}]")
     else:
         print("📊 Codex    (sem leitura de rollout)")
     dec = "PAUSE" if pauses else "GO"
