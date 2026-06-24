@@ -10,7 +10,7 @@ detecta cap/início de crédito em tempo real, e calibra o custo (US$) contra
 gastos reais de crédito. Sem dependências externas (apenas stdlib).
 
 Uso — tokens & relatórios:
-  python3 token_monitor.py ingest            # varre os .jsonl + watch.log + recalcula billing
+  python3 token_monitor.py ingest            # varre .jsonl (Claude) + rollouts (Codex) + watch.log + billing
   python3 token_monitor.py report            # default: últimos 7 dias (global)
   python3 token_monitor.py report --window 5h
   python3 token_monitor.py report --since 2026-06-01 --by billing   # assinatura × crédito
@@ -31,6 +31,7 @@ Uso — medidor oficial (porte do claude-limit-watch.sh, custo zero) + Codex (ro
   python3 token_monitor.py codex-meter --watch --interval 300   # loop; alerta reset/drop/cap (5h/semanal)
   python3 token_monitor.py codex-meter --refresh   # confirma ao vivo (1 turno mínimo do codex exec) só se um reset cruzou; --force sempre
   python3 token_monitor.py codex-meter-report # histórico do medidor do Codex
+  python3 token_monitor.py codex-report       # uso de tokens do Codex por sessão/dia/modelo (tokens + tempo)
   python3 token_monitor.py status             # resumo num olhar: Claude + Codex + veredito do gate(both)
   python3 token_monitor.py gate --provider both   # PAUSE se Claude OU Codex estourar (default --provider claude)
 
@@ -215,6 +216,21 @@ def db_connect() -> sqlite3.Connection:
         )
     """)
     con.execute("""
+        CREATE TABLE IF NOT EXISTS codex_usage (
+            rollout TEXT PRIMARY KEY,        -- caminho do rollout (1 por sessão Codex)
+            session_id TEXT,                 -- uuid da sessão (do nome do arquivo)
+            started_epoch REAL,              -- 1º timestamp do rollout
+            ended_epoch REAL,                -- último timestamp (started->ended = tempo ativo)
+            model TEXT,
+            input_tokens INTEGER,
+            cached_input_tokens INTEGER,
+            output_tokens INTEGER,
+            reasoning_output_tokens INTEGER,
+            total_tokens INTEGER,            -- cumulativo (último token_count.total_token_usage)
+            updated_epoch REAL               -- mtime do arquivo na última ingestão (idempotência)
+        )
+    """)
+    con.execute("""
         CREATE TABLE IF NOT EXISTS calibration (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT,                 -- quando foi registrado
@@ -305,8 +321,10 @@ def ingest(con: sqlite3.Connection, verbose: bool = True) -> tuple[int, int]:
     con.commit()
     n_log = ingest_watchlog(con)
     n_credits = compute_billing(con)
+    n_codex = ingest_codex(con)
     if verbose:
         extra = f" | +{n_log} leituras do watch.log" if n_log else ""
+        extra += f" | +{n_codex} sessões Codex" if n_codex else ""
         print(f"ingest: +{new_usage} mensagens de uso, +{new_limits} batidas de limite "
               f"| {n_credits} msgs ≈créditos{extra}")
     return new_usage, new_limits
@@ -942,6 +960,75 @@ def read_codex_meter(scan_files: int = 8):
     return best
 
 
+_CODEX_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_CODEX_MODEL_RE = re.compile(r'"model"\s*:\s*"([^"]+)"')
+
+
+def ingest_codex(con: sqlite3.Connection) -> int:
+    """Varre os rollouts do Codex (~/.codex/sessions) e grava o uso de tokens por
+    sessão na tabela codex_usage: total cumulativo (último token_count.total_token_usage),
+    janela de tempo (1º->último timestamp = tempo ativo) e modelo. Idempotente via mtime
+    (pula rollouts inalterados; re-ingere um que cresceu). Codex é assinatura: medimos
+    tokens e tempo, não custo por token."""
+    if not CODEX_SESSIONS_DIR.exists():
+        return 0
+    seen = {r[0]: (r[1] or 0) for r in con.execute(
+        "SELECT rollout, updated_epoch FROM codex_usage").fetchall()}
+    n = 0
+    for f in CODEX_SESSIONS_DIR.glob("*/*/*/rollout-*.jsonl"):
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        if seen.get(str(f), 0) >= mtime:
+            continue  # inalterado desde a última ingestão
+        m = _CODEX_UUID_RE.search(f.name)
+        sid = m.group(0) if m else f.stem
+        first = last = None
+        model = None
+        tot = None
+        try:
+            for line in f.open(errors="replace"):
+                if model is None:
+                    mm = _CODEX_MODEL_RE.search(line)
+                    if mm:
+                        model = mm.group(1)
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                t = o.get("timestamp")
+                if t:
+                    ep = parse_ts(t)
+                    if ep:
+                        if first is None:
+                            first = ep
+                        last = ep
+                payload = o.get("payload")
+                if isinstance(payload, dict) and payload.get("type") == "token_count":
+                    info = payload.get("info") or {}
+                    tu = info.get("total_token_usage")
+                    if isinstance(tu, dict):
+                        tot = tu
+        except OSError:
+            continue
+        if not tot:
+            continue
+        con.execute(
+            "INSERT OR REPLACE INTO codex_usage "
+            "(rollout, session_id, started_epoch, ended_epoch, model, input_tokens, "
+            "cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens, updated_epoch) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (str(f), sid, first, last, model,
+             int(tot.get("input_tokens") or 0), int(tot.get("cached_input_tokens") or 0),
+             int(tot.get("output_tokens") or 0), int(tot.get("reasoning_output_tokens") or 0),
+             int(tot.get("total_tokens") or 0), mtime),
+        )
+        n += 1
+    con.commit()
+    return n
+
+
 def codex_live_refresh(timeout: int = 120):
     """Gasta UM turno MÍNIMO do `codex exec` para forçar um rollout novo com os
     rate_limits atuais. O CLI do Codex não expõe fetch de uso sem turno (o /status da
@@ -1434,6 +1521,66 @@ def _watch_loop(label: str, interval: int, step) -> None:
         print("\nencerrado.")
 
 
+def _fmt_dur(sec) -> str:
+    sec = int(sec or 0)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def codex_report(con: sqlite3.Connection, args) -> None:
+    """Uso de tokens do Codex por sessão/dia/modelo (tabela codex_usage). Codex é
+    assinatura: reporta tokens e tempo ativo, não custo por token."""
+    now = datetime.now(timezone.utc)
+    if getattr(args, "since", ""):
+        since_epoch = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc).timestamp()
+        label = f"desde {args.since}"
+    else:
+        delta = WINDOWS.get(args.window, WINDOWS["week"])
+        since_epoch = (now - delta).timestamp()
+        label = f"últimos {args.window}"
+    group = {
+        "session": "session_id",
+        "model": "model",
+        "day": "substr(datetime(started_epoch, 'unixepoch'), 1, 10)",
+        "none": "'GLOBAL'",
+    }.get(args.by, "session_id")
+    rows = con.execute(f"""
+        SELECT {group} AS g,
+               SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
+               SUM(reasoning_output_tokens), SUM(total_tokens),
+               SUM(MAX(ended_epoch - started_epoch, 0)), COUNT(*)
+        FROM codex_usage WHERE started_epoch >= ?
+        GROUP BY g ORDER BY SUM(total_tokens) DESC
+    """, (since_epoch,)).fetchall()
+    print(f"\n=== Uso do Codex — {label} — por {args.by} ===\n")
+    if not rows:
+        print("(sem dados nesta janela; rode: token_monitor.py ingest)\n")
+        return
+
+    def nf(x):
+        return f"{int(x or 0):,}".replace(",", ".")
+
+    hdr = (f"{'grupo':<26} {'in':>13} {'cached':>13} {'out':>10} "
+           f"{'reason':>9} {'total':>13} {'tempo':>8} {'sess':>5}")
+    print(hdr)
+    print("-" * len(hdr))
+    ti = tc = to = tr = tt = td = ns = 0
+    for g, i, c, o, r, tot, dur, n in rows:
+        i, c, o, r, tot, dur, n = (int(x or 0) for x in (i, c, o, r, tot, dur, n))
+        print(f"{(str(g) if g else '?')[:26]:<26} {nf(i):>13} {nf(c):>13} {nf(o):>10} "
+              f"{nf(r):>9} {nf(tot):>13} {_fmt_dur(dur):>8} {n:>5}")
+        ti += i; tc += c; to += o; tr += r; tt += tot; td += dur; ns += n
+    print("-" * len(hdr))
+    print(f"{'TOTAL':<26} {nf(ti):>13} {nf(tc):>13} {nf(to):>10} "
+          f"{nf(tr):>9} {nf(tt):>13} {_fmt_dur(td):>8} {ns:>5}")
+    print("\nCodex é assinatura (sem custo/token); 'tempo' = ativo (1º->último evento por sessão).\n")
+
+
 def status(con: sqlite3.Connection, args) -> None:
     """Resumo de um olhar: Claude + Codex (5h/semanal) + veredito do gate (both)."""
     g5 = getattr(args, "max_5h", 80); gw = getattr(args, "max_week", 90)
@@ -1508,6 +1655,11 @@ def main() -> None:
 
     cmr = sub.add_parser("codex-meter-report", help="histórico do medidor Codex (tabela codex_meter)")
     cmr.add_argument("--limit", type=int, default=30)
+
+    cxr = sub.add_parser("codex-report", help="uso de tokens do Codex por sessão/dia/modelo (rollouts; tokens + tempo, sem custo)")
+    cxr.add_argument("--by", choices=["session", "day", "model", "none"], default="session")
+    cxr.add_argument("--window", default="week", help="5h | day | week | month")
+    cxr.add_argument("--since", default="", help="data ISO YYYY-MM-DD (sobrepõe --window)")
 
     stp = sub.add_parser("status", help="resumo de um olhar: Claude + Codex (5h/semanal) + veredito do gate")
     stp.add_argument("--max-5h", dest="max_5h", type=int, default=80)
@@ -1592,6 +1744,8 @@ def main() -> None:
             codex_meter_once(con, notify=notify, as_json=args.json)
     elif args.cmd == "codex-meter-report":
         codex_meter_report(con, args)
+    elif args.cmd == "codex-report":
+        codex_report(con, args)
     elif args.cmd == "status":
         status(con, args)
     elif args.cmd == "gate":
