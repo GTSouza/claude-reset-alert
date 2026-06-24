@@ -20,12 +20,18 @@ Uso — tokens & relatórios:
   python3 token_monitor.py bursts --session 86e5a22d  # timeline detalhada (gatilho/billing/cap)
   python3 token_monitor.py watch             # ingest contínuo
 
-Uso — medidor oficial (porte do claude-limit-watch.sh, custo zero):
+Uso — medidor oficial (porte do claude-limit-watch.sh, custo zero) + Codex (rollouts):
   python3 token_monitor.py meter             # 1 leitura de /usage (grava 5h%/semanal%/eventos)
   python3 token_monitor.py meter --watch --interval 300   # loop; alerta cap_5h/credits_started/reset/drop
   python3 token_monitor.py meter-report      # histórico do medidor
   python3 token_monitor.py gate              # veredito GO/PAUSE p/ runners (exit 0/10/2); usa cache, refaz se velho
   python3 token_monitor.py gate --json --max-5h 80 --max-week 90   # decisão estruturada p/ automação
+  python3 token_monitor.py meter --no-codex   # só Claude (por padrão mede o Codex junto, se houver rollouts)
+  python3 token_monitor.py codex-meter        # 1 leitura do rate-limit do Codex (rollouts ~/.codex/sessions)
+  python3 token_monitor.py codex-meter --watch --interval 300   # loop; alerta reset/drop/cap (5h/semanal)
+  python3 token_monitor.py codex-meter-report # histórico do medidor do Codex
+  python3 token_monitor.py status             # resumo num olhar: Claude + Codex + veredito do gate(both)
+  python3 token_monitor.py gate --provider both   # PAUSE se Claude OU Codex estourar (default --provider claude)
 
 Uso — calibração de custo (aprende fator por modelo dos gastos REAIS):
   python3 token_monitor.py calibrate --brl 47.85          # registra episódio (janela=último crédito)
@@ -40,7 +46,7 @@ Janelas (--window): 5h | day | week | month
   snapshot do app; (3) o app omite cache. Validação: Sonnet 4.6 bate exato (73.1k in / 6.2M out).
 Custo: base PRICING × fator do modelo (calibrado); ~USD. Modelo sem dado real = fator 1.0.
 Billing: token real enquanto medidor 5h==100% (após cap confirmado) = crédito; senão assinatura.
-Env úteis: METER_TZ, CREDIT_PCT, RESET_TOLERANCE, DROP_THRESHOLD, FACTORS_PATH.
+Env úteis: METER_TZ, CREDIT_PCT, RESET_TOLERANCE, DROP_THRESHOLD, FACTORS_PATH, CODEX_SESSIONS_DIR.
 """
 from __future__ import annotations
 
@@ -194,6 +200,20 @@ def db_connect() -> sqlite3.Connection:
         )
     """)
     con.execute("""
+        CREATE TABLE IF NOT EXISTS codex_meter (
+            ts TEXT PRIMARY KEY,         -- ISO UTC do snapshot (ts do rollout do Codex)
+            ts_epoch REAL,
+            session_pct REAL,            -- janela 5h (primary, 300min) % usado
+            session_reset TEXT,
+            session_reset_epoch REAL,
+            week_pct REAL,               -- janela semanal (secondary, 10080min)
+            week_reset TEXT,
+            week_reset_epoch REAL,
+            plan TEXT,                   -- plus | pro | ...
+            event TEXT                   -- 'reset_5h' | 'reset_week' | 'drop_5h' | 'drop_week' | 'cap_5h' | NULL
+        )
+    """)
+    con.execute("""
         CREATE TABLE IF NOT EXISTS calibration (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT,                 -- quando foi registrado
@@ -218,6 +238,7 @@ def db_connect() -> sqlite3.Connection:
     con.execute("CREATE INDEX IF NOT EXISTS idx_usage_epoch ON usage(ts_epoch)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_limits_epoch ON limits(ts_epoch)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_meter_epoch ON meter(ts_epoch)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_codex_meter_epoch ON codex_meter(ts_epoch)")
     con.commit()
     return con
 
@@ -671,6 +692,23 @@ def _notify(title: str, msg: str, sound: str = "Glass", tg: bool = True) -> None
                                capture_output=True)
 
 
+def _meter_alert(provider: str, plan: str | None, kind: str, win: str,
+                 pct, reset_txt, p_pct=None) -> tuple[str, str, str]:
+    """(title, msg, sound) padronizado p/ alertas de medidor (Claude e Codex iguais).
+    kind: reset | drop | cap ; win: '5h' | 'semanal'."""
+    who = provider + (f" · {plan}" if plan else "")
+    sound = "Submarine" if win == "semanal" else "Ping"
+    def r(x):
+        return round(x) if x is not None else 0
+    if kind == "reset":
+        return (f"🟢 {who} · {win} resetou", f"Nova janela {win} · próximo reset {reset_txt}", sound)
+    if kind == "drop":
+        return (f"🔵 {who} · {win} liberou", f"Uso caiu {r(p_pct)}% → {r(pct)}% · reset {reset_txt}", sound)
+    if kind == "cap":
+        return (f"🔴 {who} · {win} em 100%", f"Janela {win} capada · reset {reset_txt}", "Sosumi")
+    return (f"{who} · {win}", "", sound)
+
+
 def _fetch_usage_once() -> str:
     if not shutil.which("claude"):
         return ""
@@ -764,15 +802,15 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
         ):
             if rep and p_rep and rep - p_rep > RESET_TOLERANCE:
                 events.append(f"reset_{key}")
-                _notify(f"Claude Code: {lbl} resetou ✅", f"Nova janela. Próximo reset: {reset_txt}", sound, notify)
+                _notify(*_meter_alert("Claude Code", None, "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
             elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
                 events.append(f"drop_{key}")
-                _notify(f"Claude Code: cota {lbl} liberou ⬇️", f"Uso caiu de {p_pct}% para {pct}%", sound, notify)
+                _notify(*_meter_alert("Claude Code", None, "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct), tg=notify)
 
         # (1) janela 5h ATINGIU 100% (transição <100 -> 100)
         if s_pct is not None and s_pct >= CREDIT_PCT and p_spct is not None and p_spct < CREDIT_PCT:
             events.append("cap_5h")
-            _notify("Claude Code: 5h em 100% 🚫", "Janela capada. A partir daqui, todo uso é CRÉDITO (se o excedente estiver ligado).", "Sosumi", notify)
+            _notify(*_meter_alert("Claude Code", None, "cap", "5h", s_pct, s_reset), tg=notify)
 
     # (2) CRÉDITOS EM USO: medidor a 100% + tokens reais novos após o início do cap.
     # Com excedente desligado, 100% = robô para; logo, token a 100% = crédito.
@@ -838,38 +876,209 @@ def _latest_meter(con: sqlite3.Connection):
     ).fetchone()
 
 
-def gate(con: sqlite3.Connection, args) -> int:
-    """Veredito de rate limit. Retorna o exit code (GO/PAUSE/UNKNOWN)."""
+# --------------------------- Codex (CLI) rate-limit ------------------------- #
+# O Codex CLI não expõe comando de usage, mas grava os rate limits da conta em
+# CADA rollout de sessão (~/.codex/sessions/AAAA/MM/DD/rollout-*.jsonl), num evento
+# `token_count`: payload.rate_limits.primary (janela 300min = 5h) e .secondary
+# (10080min = semanal), com used_percent + resets_at (epoch). Lemos o mais fresco
+# ao vivo (custo zero); a leitura vale "de quando o Codex rodou pela última vez".
+CODEX_SESSIONS_DIR = Path(os.environ.get("CODEX_SESSIONS_DIR", str(Path.home() / ".codex" / "sessions")))
+
+
+def _fmt_epoch(epoch) -> str | None:
+    if not epoch:
+        return None
+    try:
+        return datetime.fromtimestamp(float(epoch)).strftime("%b %d %H:%M")
+    except Exception:
+        return str(epoch)
+
+
+def _pctstr(x) -> str:
+    return f"{round(x)}%" if x is not None else "?"
+
+
+def read_codex_meter(scan_files: int = 8):
+    """Rate-limit mais recente do Codex a partir dos rollouts. Retorna dict
+    {ts_epoch, session_pct, session_reset_epoch, week_pct, week_reset_epoch, plan}
+    ou None. session=primary(5h, 300min); week=secondary(semanal, 10080min)."""
+    if not CODEX_SESSIONS_DIR.exists():
+        return None
+    files = sorted(CODEX_SESSIONS_DIR.glob("*/*/*/rollout-*.jsonl"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)[:scan_files]
+    best = None
+    for fp in files:
+        try:
+            for line in _iter_lines(fp):
+                if '"rate_limits"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                payload = obj.get("payload") or {}
+                rl = payload.get("rate_limits") or (payload.get("info") or {}).get("rate_limits")
+                if not rl:
+                    continue
+                prim = rl.get("primary") or {}
+                sec = rl.get("secondary") or {}
+                try:
+                    ts = parse_ts(obj.get("timestamp", "")) if obj.get("timestamp") else fp.stat().st_mtime
+                except Exception:
+                    ts = fp.stat().st_mtime
+                if best is not None and ts <= best["ts_epoch"]:
+                    continue
+                best = {
+                    "ts_epoch": ts,
+                    "session_pct": prim.get("used_percent"),
+                    "session_reset_epoch": prim.get("resets_at"),
+                    "week_pct": sec.get("used_percent"),
+                    "week_reset_epoch": sec.get("resets_at"),
+                    "plan": rl.get("plan_type"),
+                }
+        except Exception:
+            continue
+    return best
+
+
+def codex_meter_once(con: sqlite3.Connection, notify: bool = True, as_json: bool = False) -> bool:
+    """Uma leitura do rate-limit do Codex: grava na tabela codex_meter e dispara
+    notificação de reset/queda/cap (mesma lógica do meter_once do Claude)."""
+    m = read_codex_meter()
+    if not m or m.get("session_pct") is None:
+        if as_json: print(json.dumps({"available": False}))
+        else: print("Codex: sem leitura de rate-limit (nenhum rollout recente com rate_limits).")
+        return False
+    ts_epoch = m["ts_epoch"]
+    ts_iso = datetime.fromtimestamp(ts_epoch, timezone.utc).isoformat()
+    s_pct = m["session_pct"]; s_re = m["session_reset_epoch"]; s_reset = _fmt_epoch(s_re)
+    w_pct = m["week_pct"]; w_re = m["week_reset_epoch"]; w_reset = _fmt_epoch(w_re)
+    age = max(0, int(datetime.now(timezone.utc).timestamp() - ts_epoch))
+
+    # evento vs a leitura anterior (reset = epoch avançou; drop = % caiu; cap = 5h>=100)
+    prev = con.execute(
+        "SELECT session_pct, session_reset_epoch, week_pct, week_reset_epoch "
+        "FROM codex_meter WHERE ts_epoch < ? ORDER BY ts_epoch DESC LIMIT 1", (ts_epoch,),
+    ).fetchone()
+    events = []
+    if prev:
+        p_spct, p_sre, p_wpct, p_wre = prev
+        for key, lbl, sound, pct, p_pct, rep, p_rep, reset_txt in (
+            ("5h", "5h", "Ping", s_pct, p_spct, s_re, p_sre, s_reset),
+            ("week", "SEMANAL", "Submarine", w_pct, p_wpct, w_re, p_wre, w_reset),
+        ):
+            if rep and p_rep and rep - p_rep > RESET_TOLERANCE:
+                events.append(f"reset_{key}")
+                _notify(*_meter_alert("Codex", m.get("plan"), "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
+            elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
+                events.append(f"drop_{key}")
+                _notify(*_meter_alert("Codex", m.get("plan"), "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct), tg=notify)
+        if s_pct is not None and s_pct >= CREDIT_PCT and p_spct is not None and p_spct < CREDIT_PCT:
+            events.append("cap_5h")
+            _notify(*_meter_alert("Codex", m.get("plan"), "cap", "5h", s_pct, s_reset), tg=notify)
+
+    con.execute(
+        "INSERT OR REPLACE INTO codex_meter VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (ts_iso, ts_epoch, s_pct, s_reset, s_re, w_pct, w_reset, w_re, m.get("plan"), ",".join(events) or None),
+    )
+    con.commit()
+
+    if as_json:
+        print(json.dumps({"available": True, "plan": m["plan"], "age_seconds": age,
+                          "session_pct": s_pct, "session_reset": s_reset,
+                          "week_pct": w_pct, "week_reset": w_reset,
+                          "event": ",".join(events) or None}, ensure_ascii=False))
+    else:
+        print(f"📊 [codex/{m['plan']}] 5h: {_pctstr(s_pct)} · reset {s_reset}  |  "
+              f"semanal: {_pctstr(w_pct)} · reset {w_reset}  (rollout {age}s)"
+              + (f"  evento: {','.join(events)}" if events else ""))
+    return True
+
+
+def codex_meter_report(con: sqlite3.Connection, args) -> None:
+    rows = con.execute(
+        "SELECT ts, plan, session_pct, session_reset, week_pct, week_reset, event "
+        "FROM codex_meter ORDER BY ts_epoch DESC LIMIT ?", (args.limit,),
+    ).fetchall()
+    print(f"\n=== Medidor Codex (rollouts) — últimas {len(rows)} leituras ===\n")
+    if not rows:
+        print("(sem leituras — rode: token_monitor.py codex-meter)\n"); return
+    print(f"{'quando (UTC)':<22}{'plano':<7}{'5h':>6}{'  reset 5h':<16}{'sem':>6}{'  reset semanal':<16}{'  evento'}")
+    print("-" * 94)
+    for ts, plan, sp, sr, wp, wr, ev in rows:
+        print(f"{ts[:19]:<22}{(plan or '?'):<7}{_pctstr(sp):>6}  {(sr or '?')[:14]:<16}{_pctstr(wp):>6}  {(wr or '?')[:14]:<16}{'  '+ev if ev else ''}")
+    print()
+
+
+def _claude_reading(con: sqlite3.Connection, args) -> dict:
+    """Leitura Claude (medidor /usage via DB, refaz se velha)."""
     now = datetime.now(timezone.utc).timestamp()
     row = _latest_meter(con)
     age = (now - row[0]) if row else None
     stale = row is None or age > args.max_age
     refreshed = False
     if args.refresh or stale:
-        # leitura velha/ausente → busca ao vivo (custo zero de cota) e relê o banco
         meter_once(con, notify=not args.no_notify)
         row = _latest_meter(con)
-        # a leitura acabou de ser gravada (ts > now capturado acima); age = 0 (não
-        # negativo, que vazaria como age_seconds < 0 no --json).
         age = 0.0 if row else None
         refreshed = True
-
     if not row or row[1] is None or row[3] is None:
-        s_pct = w_pct = s_reset = w_reset = None
-        reasons = ["sem leitura válida do medidor"]
+        return {"label": "claude", "session_pct": None, "session_reset": None,
+                "week_pct": None, "week_reset": None, "source": "sem leitura", "refreshed": refreshed}
+    _, s_pct, s_reset, w_pct, w_reset = row
+    src = "ao vivo" if refreshed else (f"cache {int(age)}s" if age is not None else "—")
+    return {"label": "claude", "session_pct": s_pct, "session_reset": s_reset,
+            "week_pct": w_pct, "week_reset": w_reset, "source": src, "refreshed": refreshed}
+
+
+def _codex_reading(args) -> dict:
+    m = read_codex_meter()
+    if not m or m.get("session_pct") is None:
+        return {"label": "codex", "session_pct": None, "session_reset": None,
+                "week_pct": None, "week_reset": None, "source": "sem leitura", "refreshed": False}
+    age = max(0, int(datetime.now(timezone.utc).timestamp() - m["ts_epoch"]))
+    return {"label": "codex", "session_pct": m["session_pct"], "session_reset": _fmt_epoch(m["session_reset_epoch"]),
+            "week_pct": m["week_pct"], "week_reset": _fmt_epoch(m["week_reset_epoch"]),
+            "source": f"rollout {age}s", "refreshed": False}
+
+
+def gate(con: sqlite3.Connection, args) -> int:
+    """Veredito de rate limit (GO/PAUSE/UNKNOWN). Com --provider both, PAUSE se
+    Claude OU Codex estourar. Retorna o exit code."""
+    provider = getattr(args, "provider", "claude")
+    readings = []
+    if provider in ("claude", "both"):
+        readings.append(_claude_reading(con, args))
+    if provider in ("codex", "both"):
+        readings.append(_codex_reading(args))
+
+    reasons = []
+    any_valid = False
+    for rd in readings:
+        if rd["session_pct"] is None or rd["week_pct"] is None:
+            continue
+        any_valid = True
+        if rd["session_pct"] >= args.max_5h:
+            reasons.append(f"{rd['label']} 5h em {round(rd['session_pct'])}% (>= {args.max_5h}%)")
+        if rd["week_pct"] >= args.max_week:
+            reasons.append(f"{rd['label']} semanal em {round(rd['week_pct'])}% (>= {args.max_week}%)")
+
+    if not any_valid:
         decision, code = "UNKNOWN", GATE_UNKNOWN
+        reasons = reasons or ["sem leitura válida do medidor"]
     else:
-        _, s_pct, s_reset, w_pct, w_reset = row
-        reasons = []
-        if s_pct >= args.max_5h:
-            reasons.append(f"5h em {s_pct}% (>= {args.max_5h}%)")
-        if w_pct >= args.max_week:
-            reasons.append(f"semanal em {w_pct}% (>= {args.max_week}%)")
         decision = "GO" if not reasons else "PAUSE"
         code = GATE_GO if not reasons else GATE_PAUSE
 
-    # Tudo mastigado: a própria ferramenta decide, explica e já entrega o bloco de
-    # pausa pronto pra colar. A SKILL só executa e segue o texto literalmente.
+    # binding (pior leitura) para o cabeçalho + compat dos campos de topo no --json
+    valids = [r for r in readings if r["session_pct"] is not None]
+    worst = max(valids, key=lambda r: r["session_pct"], default=None)
+    s_pct = worst["session_pct"] if worst else None
+    s_reset = worst["session_reset"] if worst else None
+    w_pct = worst["week_pct"] if worst else None
+    w_reset = worst["week_reset"] if worst else None
+    refreshed = any(r.get("refreshed") for r in readings)
+
     motivo = "; ".join(reasons) if reasons else ""
     if decision == "GO":
         advice = "Pode iniciar a próxima tarefa. Rode o gate de novo após 1–2 tarefas."
@@ -878,8 +1087,7 @@ def gate(con: sqlite3.Connection, args) -> int:
                   "e responda no formato de pausa abaixo (preencha <N> e as listas).")
     else:
         advice = ("Sem leitura válida do medidor — trate como PAUSE (conservador). "
-                  "Rode `token_monitor.py meter` para forçar uma leitura ao vivo.")
-    # Cabeçalho de pausa pronto (relevante em PAUSE/UNKNOWN)
+                  "Rode `token_monitor.py meter` (Claude) / `codex-meter` para forçar.")
     pause_header = (
         "pausado: <N> tarefas restantes\n"
         f"motivo: {motivo or 'medidor indisponível'}\n"
@@ -888,16 +1096,23 @@ def gate(con: sqlite3.Connection, args) -> int:
     )
     verdict = {"decision": decision, "reasons": reasons, "advice": advice,
                "pause_header": None if decision == "GO" else pause_header,
+               "provider": provider,
+               "providers": [{"label": r["label"], "session_pct": r["session_pct"],
+                              "session_reset": r["session_reset"], "week_pct": r["week_pct"],
+                              "week_reset": r["week_reset"], "source": r["source"]} for r in readings],
                "session_pct": s_pct, "week_pct": w_pct, "session_reset": s_reset,
-               "week_reset": w_reset, "age_seconds": int(age) if age is not None else None,
-               "refreshed": refreshed, "max_5h": args.max_5h, "max_week": args.max_week}
+               "week_reset": w_reset, "refreshed": refreshed,
+               "max_5h": args.max_5h, "max_week": args.max_week}
 
     if args.json:
         print(json.dumps(verdict, ensure_ascii=False))
         return code
 
-    src = "ao vivo" if refreshed else (f"cache {verdict['age_seconds']}s" if verdict["age_seconds"] is not None else "—")
-    print(f"📊 5h: {s_pct}% · reset {s_reset}  |  semanal: {w_pct}% · reset {w_reset}  ({src})")
+    multi = len(readings) > 1
+    for r in readings:
+        pre = f"[{r['label']}] " if multi else ""
+        print(f"📊 {pre}5h: {_pctstr(r['session_pct'])} · reset {r['session_reset']}  |  "
+              f"semanal: {_pctstr(r['week_pct'])} · reset {r['week_reset']}  ({r['source']})")
     if motivo:
         print(f"motivo: {motivo}")
     print(f"DECISION: {decision}")
@@ -1161,10 +1376,39 @@ def _watch_loop(label: str, interval: int, step) -> None:
     print(f"{label} a cada {interval}s (Ctrl-C para sair)")
     try:
         while True:
+            print(f"── {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ──")
             step()
             time.sleep(interval)
     except KeyboardInterrupt:
         print("\nencerrado.")
+
+
+def status(con: sqlite3.Connection, args) -> None:
+    """Resumo de um olhar: Claude + Codex (5h/semanal) + veredito do gate (both)."""
+    g5 = getattr(args, "max_5h", 80); gw = getattr(args, "max_week", 90)
+    row = _latest_meter(con)
+    cm = read_codex_meter()
+    print(f"\n=== Status — Claude + Codex (gate 5h<{g5}% · semanal<{gw}%) ===\n")
+    pauses = []
+    if row and row[1] is not None:
+        _, sp, sr, wp, wr = row
+        if sp >= g5 or wp >= gw: pauses.append("claude")
+        flag = "  🛑" if "claude" in pauses else ""
+        print(f"📊 Claude   5h: {_pctstr(sp)} · reset {sr}   |   semanal: {_pctstr(wp)} · reset {wr}{flag}")
+    else:
+        print("📊 Claude   (sem leitura — rode: token_monitor.py meter)")
+    if cm and cm.get("session_pct") is not None:
+        sp = cm["session_pct"]; wp = cm["week_pct"]
+        if sp >= g5 or wp >= gw: pauses.append("codex")
+        flag = "  🛑" if "codex" in pauses else ""
+        age = max(0, int(datetime.now(timezone.utc).timestamp() - cm["ts_epoch"]))
+        print(f"📊 Codex    5h: {_pctstr(sp)} · reset {_fmt_epoch(cm['session_reset_epoch'])}   |   "
+              f"semanal: {_pctstr(wp)} · reset {_fmt_epoch(cm['week_reset_epoch'])}{flag}   [{cm['plan']}, {age}s]")
+    else:
+        print("📊 Codex    (sem leitura de rollout)")
+    dec = "PAUSE" if pauses else "GO"
+    icon = "🛑" if pauses else "➡️ "
+    print(f"\n{icon} gate(both): {dec}" + (f" — estourado: {', '.join(pauses)}" if pauses else "") + "\n")
 
 
 def main() -> None:
@@ -1192,15 +1436,31 @@ def main() -> None:
     wp = sub.add_parser("watch", help="ingest contínuo")
     wp.add_argument("--interval", type=int, default=60)
 
-    mp = sub.add_parser("meter", help="lê o medidor oficial /usage (custo zero) e grava na tabela meter")
+    mp = sub.add_parser("meter", help="lê o medidor oficial /usage (Claude) — e o Codex junto, se disponível")
     mp.add_argument("--watch", action="store_true", help="loop contínuo")
     mp.add_argument("--interval", type=int, default=300)
     mp.add_argument("--no-notify", action="store_true", help="não notificar (macOS/Telegram)")
+    mp.add_argument("--no-codex", action="store_true", help="medir só o Claude (não medir o Codex junto)")
 
     mr = sub.add_parser("meter-report", help="histórico do medidor oficial")
     mr.add_argument("--limit", type=int, default=30)
 
+    cm = sub.add_parser("codex-meter", help="lê o rate-limit do Codex (rollouts) e grava na tabela codex_meter")
+    cm.add_argument("--watch", action="store_true", help="loop contínuo (igual ao meter --watch)")
+    cm.add_argument("--interval", type=int, default=300)
+    cm.add_argument("--no-notify", action="store_true", help="não notificar (macOS/Telegram)")
+    cm.add_argument("--json", action="store_true", help="saída JSON")
+
+    cmr = sub.add_parser("codex-meter-report", help="histórico do medidor Codex (tabela codex_meter)")
+    cmr.add_argument("--limit", type=int, default=30)
+
+    stp = sub.add_parser("status", help="resumo de um olhar: Claude + Codex (5h/semanal) + veredito do gate")
+    stp.add_argument("--max-5h", dest="max_5h", type=int, default=80)
+    stp.add_argument("--max-week", dest="max_week", type=int, default=90)
+
     gp = sub.add_parser("gate", help="veredito GO/PAUSE de rate limit (exit 0/10/2) p/ runners")
+    gp.add_argument("--provider", choices=["claude", "codex", "both"], default="claude",
+                    help="qual medidor gatear (default claude). 'both' = PAUSE se Claude OU Codex estourar")
     gp.add_argument("--max-5h", dest="max_5h", type=int, default=80, help="teto da janela 5h em %% (default 80)")
     gp.add_argument("--max-week", dest="max_week", type=int, default=90, help="teto semanal em %% (default 90)")
     gp.add_argument("--max-age", dest="max_age", type=int, default=300,
@@ -1247,12 +1507,28 @@ def main() -> None:
         _watch_loop("watch: ingest", args.interval, lambda: ingest(con))
     elif args.cmd == "meter":
         notify = not args.no_notify
+        with_codex = (not args.no_codex) and CODEX_SESSIONS_DIR.exists()
+        def _meter_tick():
+            ok = meter_once(con, notify=notify)
+            if with_codex:
+                codex_meter_once(con, notify=notify)
+            return ok
         if args.watch:
-            _watch_loop("meter: /usage", args.interval, lambda: meter_once(con, notify=notify))
+            _watch_loop("meter: /usage" + (" + codex" if with_codex else ""), args.interval, _meter_tick)
         else:
-            meter_once(con, notify=notify)
+            _meter_tick()
     elif args.cmd == "meter-report":
         meter_report(con, args)
+    elif args.cmd == "codex-meter":
+        notify = not args.no_notify
+        if args.watch:
+            _watch_loop("codex-meter", args.interval, lambda: codex_meter_once(con, notify=notify))
+        else:
+            codex_meter_once(con, notify=notify, as_json=args.json)
+    elif args.cmd == "codex-meter-report":
+        codex_meter_report(con, args)
+    elif args.cmd == "status":
+        status(con, args)
     elif args.cmd == "gate":
         code = gate(con, args)
         con.close()

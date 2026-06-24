@@ -96,7 +96,7 @@ _TELEGRAM_LIMIT = 4096
     name="send_token_report",
     description=(
         "Run token_monitor.py and send the output to Telegram. "
-        "Subcommands: report, limits, meter-report, bursts. "
+        "Subcommands: report, limits, meter-report, codex-meter-report, status, bursts. "
         "For 'report': supports window, since, by, model_filter, session_filter, project_filter, io_only. "
         "Examples: filter by model 'claude-fable-5' → model_filter='claude-fable-5'; "
         "last 5h → window='5h'; since a date → since='2026-06-01'; "
@@ -104,7 +104,7 @@ _TELEGRAM_LIMIT = 4096
     ),
 )
 def send_token_report(
-    command: str = Field(default="report", description="Subcommand: report, limits, meter-report, bursts"),
+    command: str = Field(default="report", description="Subcommand: report, limits, meter-report, codex-meter-report, status, bursts"),
     window: str = Field(default="week", description="Time window: 5h, day, week, month (report only, ignored if since is set)"),
     since: str = Field(default="", description="Start date ISO YYYY-MM-DD, overrides window (report only)"),
     by: str = Field(default="none", description="Group by: model, session, project, day, billing, none (report only)"),
@@ -130,7 +130,7 @@ def send_token_report(
             cmd += ["--project", project_filter]
         if io_only:
             cmd += ["--io-only"]
-    elif command in ("limits", "meter-report"):
+    elif command in ("limits", "meter-report", "codex-meter-report"):
         cmd += ["--limit", str(limit)]
 
     try:
