@@ -266,9 +266,12 @@ chmod +x ~/.claude/tools/token_monitor.py   # permite a invocação direta `toke
 | `ingest` | Varre os `.jsonl` + `watch.log` e popula o banco (idempotente, incremental). |
 | `report` | Relatório agregado por janela (`--window 5h/day/week/month`) e eixo (`--by model/session/project/day/billing/none`). `--io-only` mostra só in/out (comparável ao app do Claude). |
 | `limits` | Episódios em que você bateu o limite. |
-| `meter` | Uma leitura do `/usage` (custo zero); grava 5h%/semanal% na tabela `meter` e alerta reset/queda/cap. `--watch --interval 300` roda em loop. |
+| `meter` | Uma leitura do `/usage` do Claude (custo zero) — **e o Codex junto, se houver rollouts** (`--no-codex` desliga); grava na tabela `meter` e alerta reset/queda/cap. `--watch --interval 300` roda em loop. |
 | `meter-report` | Histórico das leituras do medidor. |
-| **`gate`** | **Veredito GO/PAUSE de rate limit** para runners — ver abaixo. |
+| `codex-meter` | Uma leitura do rate-limit do **Codex** a partir dos rollouts `~/.codex/sessions` (custo zero); grava na tabela `codex_meter` e alerta reset/queda/cap. `--watch --interval 300` roda em loop. |
+| `codex-meter-report` | Histórico das leituras do medidor do Codex. |
+| `status` | Resumo num olhar: Claude + Codex (5h/semanal) + veredito do `gate --provider both`. |
+| **`gate`** | **Veredito GO/PAUSE de rate limit** para runners; `--provider {claude,codex,both}` (default `claude`) — ver abaixo. |
 | `calibrate` | Aprende o fator de custo real por modelo a partir de gastos reais de crédito (`--brl`/`--usd`, `--solve`, `--apply`). |
 | `bursts` | Detalha clusters de atividade (gatilho manual × wakeup × task, billing, modelos, cap). |
 
@@ -308,6 +311,62 @@ semanal: 80%
 | `--refresh` | — | Força a leitura ao vivo do `/usage` agora. |
 | `--json` | — | Saída estruturada em vez de texto. |
 | `--no-notify` | — | Não notifica ao refazer a leitura. |
+
+### Codex (rate-limit)
+
+Além do Claude Code, o monitor mede o uso do **Codex CLI** — tudo **aditivo e backward-compatible** (nada do fluxo do Claude muda). O Codex não tem um `/usage`, mas grava os rate limits da conta em cada rollout de sessão (`~/.codex/sessions/AAAA/MM/DD/rollout-*.jsonl`), num evento `token_count` com `rate_limits.primary` (janela de **5h**) e `rate_limits.secondary` (**semanal**), cada um com `used_percent` + `resets_at`. O monitor lê o rollout mais fresco **ao vivo, custo zero** (vale "de quando o Codex rodou pela última vez").
+
+```bash
+~/.claude/tools/token_monitor.py codex-meter          # 1 leitura do rate-limit do Codex; grava em codex_meter + alerta
+~/.claude/tools/token_monitor.py codex-meter --watch --interval 300   # loop; alerta reset/queda/cap
+~/.claude/tools/token_monitor.py codex-meter --json   # saída estruturada
+~/.claude/tools/token_monitor.py codex-meter-report   # histórico (tabela codex_meter)
+```
+
+A detecção de evento é a mesma do medidor do Claude (compara com a leitura anterior na tabela): **reset** quando o horário de reset avança além de `RESET_TOLERANCE`, **drop** quando o % cai além de `DROP_THRESHOLD`, **cap** quando a janela de 5h cruza 100%. Cada evento dispara desktop + som + Telegram.
+
+#### `meter` agora inclui o Codex
+
+`meter` (a leitura do `/usage` do Claude) também mede o Codex por padrão, quando há rollouts — inclusive em `meter --watch`. A linha do Claude (`5h: N% usado · reset ...`, que o `ingest`/`watch.log` parseia) **fica inalterada**.
+
+```bash
+~/.claude/tools/token_monitor.py meter               # Claude + Codex (se houver rollouts)
+~/.claude/tools/token_monitor.py meter --no-codex    # só Claude (comportamento antigo)
+```
+
+#### Gate por provider
+
+O `gate` ganhou `--provider {claude,codex,both}`. **O default é `claude`** — veredito, exit codes e bloco de pausa idênticos. Com `--provider both`, aplica os tetos aos dois medidores e decide **PAUSE se Claude OU Codex estourar** (o cabeçalho usa a pior leitura).
+
+```bash
+~/.claude/tools/token_monitor.py gate                      # só Claude (default, inalterado)
+~/.claude/tools/token_monitor.py gate --provider both      # PAUSE se Claude OU Codex estourar
+~/.claude/tools/token_monitor.py gate --provider codex --json
+```
+
+Com dois providers cada leitura é prefixada (`[claude]`/`[codex]`) e o `motivo:` cita o provider (ex.: `codex 5h em 92% (>= 80%)`). O `--json` ganhou `provider` e `providers[]` (uma entrada por medidor); os campos de topo (`decision`/`advice`/`pause_header`/`session_*`/`week_*`) seguem o **mesmo contrato** e refletem a pior leitura.
+
+> **Contratos preservados:** a linha `DECISION:`, os exit codes `0`/`10`/`2`, o bloco `─── cole e complete ───` e as chaves do `--json` não mudaram. A única diferença cosmética é o `motivo:` prefixar o provider (ex.: `claude 5h em X%`).
+
+#### `status` — resumo num olhar
+
+```bash
+~/.claude/tools/token_monitor.py status                       # gate 5h<80% · semanal<90% (defaults)
+~/.claude/tools/token_monitor.py status --max-5h 70 --max-week 85
+```
+
+```text
+=== Status — Claude + Codex (gate 5h<80% · semanal<90%) ===
+
+📊 Claude   5h: 95% · reset Jun 24 at 4:39pm   |   semanal: 80% · reset Jun 30 at 9am  🛑
+📊 Codex    5h: 42% · reset Jun 24 at 6:10pm   |   semanal: 18% · reset Jun 30 at 9am   [pro, 312s]
+
+🛑 gate(both): PAUSE — estourado: claude
+```
+
+#### Tabela `codex_meter` e env
+
+O medidor do Codex grava na tabela nova `codex_meter` no mesmo SQLite, separada do `meter` do Claude (uma linha por leitura: `ts` UTC do rollout, plano, `session_pct`/`week_pct` + resets, e os eventos). O diretório de rollouts é configurável via `CODEX_SESSIONS_DIR` (default `~/.codex/sessions`); sem rollout recente com `rate_limits`, o medidor só reporta "sem leitura" e segue (não é erro).
 
 ---
 

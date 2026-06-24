@@ -41,6 +41,12 @@ Tetos default: `--max-5h 80` e `--max-week 90` (cobre 5h e semanal juntos). Ajus
 usuário pedir (ex.: `gate --max-5h 70`). Para automação, `gate --json` traz os mesmos
 campos prontos, incluindo `advice` e `pause_header`.
 
+Por padrão o gate mede só o provedor primário (`--provider claude`) — decisão, exit codes
+(`0`/`10`/`2`) e bloco de pausa idênticos. Se um lote usar dois modelos (um implementa, outro
+revisa), `--provider both` retorna `PAUSE` se qualquer um estourar e o `motivo:` prefixa o
+provedor responsável; `--provider codex` mede só o revisor. O contrato (`DECISION:`, exit,
+`pause_header`, chaves do `--json`) é o mesmo em qualquer modo.
+
 Nunca use `budget` do Workflow como medidor de consumo: ele não representa o consumo real.
 
 ## Fluxo padrão
@@ -71,8 +77,11 @@ Nunca use `budget` do Workflow como medidor de consumo: ele não representa o co
 Use só quando precisar investigar consumo (não no loop normal):
 
 ```bash
-~/.claude/tools/token_monitor.py meter            # força uma leitura ao vivo do /usage
-~/.claude/tools/token_monitor.py meter-report     # histórico das leituras
+~/.claude/tools/token_monitor.py status               # resumo num olhar: ambos os provedores + veredito do gate
+~/.claude/tools/token_monitor.py meter                # força uma leitura ao vivo do /usage (mede o Codex junto; --no-codex desliga)
+~/.claude/tools/token_monitor.py meter-report         # histórico das leituras
+~/.claude/tools/token_monitor.py codex-meter          # força a leitura do medidor do revisor
+~/.claude/tools/token_monitor.py codex-meter-report   # histórico do medidor do revisor
 ~/.claude/tools/token_monitor.py bursts --session <id>
 ~/.claude/tools/token_monitor.py report --by billing
 ```
