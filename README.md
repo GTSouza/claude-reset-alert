@@ -320,10 +320,18 @@ Além do Claude Code, o monitor mede o uso do **Codex CLI** — tudo **aditivo e
 ~/.claude/tools/token_monitor.py codex-meter          # 1 leitura do rate-limit do Codex; grava em codex_meter + alerta
 ~/.claude/tools/token_monitor.py codex-meter --watch --interval 300   # loop; alerta reset/queda/cap
 ~/.claude/tools/token_monitor.py codex-meter --json   # saída estruturada
+~/.claude/tools/token_monitor.py codex-meter --refresh   # confirma ao vivo (1 turno mínimo do codex exec) só se um reset já cruzou; --force sempre
 ~/.claude/tools/token_monitor.py codex-meter-report   # histórico (tabela codex_meter)
 ```
 
 A detecção de evento é a mesma do medidor do Claude (compara com a leitura anterior na tabela): **reset** quando o horário de reset avança além de `RESET_TOLERANCE`, **drop** quando o % cai além de `DROP_THRESHOLD`, **cap** quando a janela de 5h cruza 100%. Cada evento dispara desktop + som + Telegram.
+
+#### Snapshot estático, inferência de reset e `--refresh`
+
+O rollout é um **snapshot da última vez que o Codex rodou** — não se atualiza sozinho (o `/status` da TUI mostra o mesmo dado, só parece "ao vivo" porque a sessão está ativa). Para não ficar preso num valor velho, o medidor faz duas coisas:
+
+- **Inferência de reset (no gate):** como `resets_at` é epoch absoluto, uma janela cujo reset já passou é tratada como recuperada (~0%) mesmo sem o Codex rodar. Sem isso, um `gate --provider codex` ficaria preso no % antigo para sempre e um runner gated em Codex nunca acordaria.
+- **Confirmação ao vivo (`codex-meter --refresh`):** gasta **1 turno mínimo** do `codex exec` para obter o número real, mas **só quando um reset já cruzou desde o rollout** (antes disso a leitura ainda é válida, pois sem o Codex rodar o uso não muda). `--force` gasta sempre. Use fora de um loop ativo quando quiser confirmar o reset em vez de só inferir.
 
 #### `meter` agora inclui o Codex
 
