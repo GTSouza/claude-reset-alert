@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import html as _html
 import json
 import os
 import re
@@ -693,39 +694,62 @@ def _load_tg() -> tuple[str, str]:
     return tok, chat
 
 
+def _strip_html(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s)
+
+
 def _notify(title: str, msg: str, sound: str = "Glass", tg: bool = True) -> None:
-    print(f"🔔 {title} — {msg}")
+    plain_t, plain_m = _strip_html(title), _strip_html(msg)
+    print(f"🔔 {plain_t} — {plain_m}")
     if sys.platform == "darwin" and shutil.which("osascript"):
-        safe_t = title.replace('"', '\\"'); safe_m = msg.replace('"', '\\"')
+        safe_t = plain_t.replace('"', '\\"')
+        safe_m = plain_m.replace('"', '\\"')
         subprocess.run(["osascript", "-e",
                         f'display notification "{safe_m}" with title "{safe_t}" sound name "{sound}"'],
                        capture_output=True)
     if tg:
-        tok, chat = _load_tg()
-        if tok and chat and shutil.which("curl"):
+        tg_tok, chat = _load_tg()
+        if tg_tok and chat and shutil.which("curl"):
             for cid in (c.strip() for c in chat.split(",") if c.strip()):
                 subprocess.run(["curl", "-s", "-m", "10", "-o", "/dev/null",
                                 "--data-urlencode", f"chat_id={cid}",
                                 "--data-urlencode", f"text=🤖 {title}\n{msg}",
-                                f"https://api.telegram.org/bot{tok}/sendMessage"],
+                                "--data-urlencode", "parse_mode=HTML",
+                                f"https://api.telegram.org/bot{tg_tok}/sendMessage"],
                                capture_output=True)
 
 
 def _meter_alert(provider: str, plan: str | None, kind: str, win: str,
-                 pct, reset_txt, p_pct=None) -> tuple[str, str, str]:
+                 pct, reset_txt, p_pct=None, n_tok: int | None = None,
+                 flagged: bool = False) -> tuple[str, str, str]:
     """(title, msg, sound) padronizado p/ alertas de medidor (Claude e Codex iguais).
-    kind: reset | drop | cap ; win: '5h' | 'semanal'."""
+    kind: reset | drop | cap | credits ; win: '5h' | 'semanal'.
+    flagged=True adiciona ⚠️ ao título (drop fora do horário de reset esperado).
+    Título e msg usam HTML (Telegram parse_mode=HTML); _notify strip para console/macOS."""
     who = provider + (f" · {plan}" if plan else "")
+    who_b = f"<b>{_html.escape(who)}</b>"
     sound = "Submarine" if win == "semanal" else "Ping"
+    r_txt = _html.escape(re.sub(r"\s*\([^)]*\)\s*$", "", reset_txt or "?").strip())
+    flag = " ⚠️" if flagged else ""
     def r(x):
         return round(x) if x is not None else 0
     if kind == "reset":
-        return (f"🟢 {who} · {win} resetou", f"Nova janela {win} · próximo reset {reset_txt}", sound)
+        return (f"🟢 {who_b} · {win} resetou",
+                f"Nova janela {win} — <b>{r(pct)}%</b> usado · reset {r_txt}", sound)
     if kind == "drop":
-        return (f"🔵 {who} · {win} liberou", f"Uso caiu {r(p_pct)}% → {r(pct)}% · reset {reset_txt}", sound)
+        if r(pct) == 0:
+            return (f"🟢 {who_b} · {win} resetou{flag}",
+                    f"Nova janela {win} — <b>0%</b> usado · reset {r_txt}", sound)
+        return (f"🔵 {who_b} · {win} liberou{flag}",
+                f"Uso caiu <b>{r(p_pct)}% → {r(pct)}%</b> · reset {r_txt}", sound)
     if kind == "cap":
-        return (f"🔴 {who} · {win} em 100%", f"Janela {win} capada · reset {reset_txt}", "Sosumi")
-    return (f"{who} · {win}", "", sound)
+        return (f"🔴 {who_b} · {win} em 100%",
+                f"Janela {win} capada · reset {r_txt}", "Sosumi")
+    if kind == "credits":
+        t = f"{n_tok:,}".replace(",", ".") if n_tok is not None else "?"
+        return (f"💳 {who_b} · {win} em crédito",
+                f"<b>{t}</b> tokens além da cota · reset {r_txt}", "Glass")
+    return (f"{who_b} · {win}", "", sound)
 
 
 def _fetch_usage_once() -> str:
@@ -824,7 +848,8 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
                 _notify(*_meter_alert("Claude Code", None, "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
             elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
                 events.append(f"drop_{key}")
-                _notify(*_meter_alert("Claude Code", None, "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct), tg=notify)
+                near_reset = p_rep is not None and abs(now.timestamp() - p_rep) < 1800
+                _notify(*_meter_alert("Claude Code", None, "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct, flagged=not near_reset), tg=notify)
 
         # (1) janela 5h ATINGIU 100% (transição <100 -> 100)
         if s_pct is not None and s_pct >= CREDIT_PCT and p_spct is not None and p_spct < CREDIT_PCT:
@@ -853,7 +878,7 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
         ).fetchone()[0]
         if tok > 0 and not already:
             events.append("credits_started")
-            _notify("Claude Code: CRÉDITOS iniciados 💳", f"{tok:,} tokens de output produzidos após o cap das 5h.", "Glass", notify)
+            _notify(*_meter_alert("Claude Code", None, "credits", "5h", s_pct, s_reset, n_tok=tok), tg=notify)
 
     con.execute(
         "INSERT OR REPLACE INTO meter VALUES (?,?,?,?,?,?,?,?,?)",
@@ -1105,7 +1130,8 @@ def codex_meter_once(con: sqlite3.Connection, notify: bool = True, as_json: bool
                 _notify(*_meter_alert("Codex", m.get("plan"), "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
             elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
                 events.append(f"drop_{key}")
-                _notify(*_meter_alert("Codex", m.get("plan"), "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct), tg=notify)
+                near_reset = p_rep is not None and abs(ts_epoch - p_rep) < 1800
+                _notify(*_meter_alert("Codex", m.get("plan"), "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct, flagged=not near_reset), tg=notify)
         if s_pct is not None and s_pct >= CREDIT_PCT and p_spct is not None and p_spct < CREDIT_PCT:
             events.append("cap_5h")
             _notify(*_meter_alert("Codex", m.get("plan"), "cap", "5h", s_pct, s_reset), tg=notify)

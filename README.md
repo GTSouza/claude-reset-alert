@@ -37,11 +37,16 @@ Current week (Sonnet only): 0% used
 Para cada janela (5h e semanal), dispara uma notificação quando:
 
 1. **O horário de reset avança** além de `RESET_TOLERANCE` → começou uma nova janela; ou
-2. **O % de uso cai** além de `DROP_THRESHOLD` → a cota liberou antes do previsto.
+2. **O % de uso cai** além de `DROP_THRESHOLD` → a cota liberou ou a janela resetou.
+
+Quando o evento é um **drop** (% caiu sem o epoch avançar):
+- Se o novo % é **0%** → mensagem de "resetou" (🟢), idêntica ao reset por epoch.
+- Se o novo % ainda é **> 0%** → mensagem de "liberou" (🔵), indicando queda parcial.
+- Se o drop ocorreu **fora de ±30 min do reset esperado** (reset antecipado ou queda inesperada) → ⚠️ adicionado ao título.
 
 > O texto do `/usage` arredonda os minutos a cada consulta (ex.: `3pm` ↔ `2:59pm`), então a detecção compara o **instante** do reset com tolerância (`RESET_TOLERANCE`, padrão 600s) em vez do texto literal — assim variações de poucos minutos não geram falsos alertas de reset.
 
-Em ambos os casos você recebe: **notificação no desktop** + **som** (distinto por janela) + **mensagem no Telegram** (se configurado).
+Em todos os casos você recebe: **notificação no desktop** + **som** (distinto por janela) + **mensagem no Telegram** (se configurado).
 
 ## Versões por plataforma
 
@@ -324,7 +329,7 @@ Além do Claude Code, o monitor mede o uso do **Codex CLI** — tudo **aditivo e
 ~/.claude/tools/token_monitor.py codex-meter-report   # histórico (tabela codex_meter)
 ```
 
-A detecção de evento é a mesma do medidor do Claude (compara com a leitura anterior na tabela): **reset** quando o horário de reset avança além de `RESET_TOLERANCE`, **drop** quando o % cai além de `DROP_THRESHOLD`, **cap** quando a janela de 5h cruza 100%. Cada evento dispara desktop + som + Telegram.
+A detecção de evento é a mesma do medidor do Claude (compara com a leitura anterior na tabela): **reset** quando o horário de reset avança além de `RESET_TOLERANCE`, **drop** quando o % cai além de `DROP_THRESHOLD`, **cap** quando a janela de 5h cruza 100%. Cada evento dispara desktop + som + Telegram. O formato das mensagens é idêntico entre Claude e Codex — veja a seção acima para a lógica de ⚠️ em drops fora do horário de reset.
 
 #### Snapshot estático, inferência de reset e `--refresh`
 
