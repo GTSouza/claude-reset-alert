@@ -1113,10 +1113,14 @@ def codex_meter_once(con: sqlite3.Connection, notify: bool = True, as_json: bool
     w_pct = m["week_pct"]; w_re = m["week_reset_epoch"]; w_reset = _fmt_epoch(w_re)
     age = max(0, int(datetime.now(timezone.utc).timestamp() - ts_epoch))
 
-    # evento vs a leitura anterior (reset = epoch avançou; drop = % caiu; cap = 5h>=100)
+    # Evento vs o último estado gravado. É importante incluir uma linha com o mesmo
+    # ts_epoch: um rollout parado é lido novamente a cada poll e deve ser idempotente.
+    # Excluí-la faria o mesmo snapshot ser comparado para sempre com o rollout anterior,
+    # repetindo o alerta de reset em todo ciclo do watch.
     prev = con.execute(
         "SELECT session_pct, session_reset_epoch, week_pct, week_reset_epoch "
-        "FROM codex_meter WHERE ts_epoch < ? ORDER BY ts_epoch DESC LIMIT 1", (ts_epoch,),
+        "FROM codex_meter WHERE ts_epoch <= ? ORDER BY ts_epoch DESC LIMIT 1",
+        (ts_epoch,),
     ).fetchone()
     events = []
     if prev:
@@ -1125,7 +1129,10 @@ def codex_meter_once(con: sqlite3.Connection, notify: bool = True, as_json: bool
             ("5h", "5h", "Ping", s_pct, p_spct, s_re, p_sre, s_reset),
             ("week", "SEMANAL", "Submarine", w_pct, p_wpct, w_re, p_wre, w_reset),
         ):
-            if rep and p_rep and rep - p_rep > RESET_TOLERANCE:
+            # Um reset só é notificável quando o novo snapshot também trouxe uma
+            # porcentagem diferente. Avanço isolado de resets_at não é mudança de uso.
+            pct_changed = pct is not None and p_pct is not None and pct != p_pct
+            if pct_changed and rep and p_rep and rep - p_rep > RESET_TOLERANCE:
                 events.append(f"reset_{key}")
                 _notify(*_meter_alert("Codex", m.get("plan"), "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
             elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
