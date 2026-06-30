@@ -257,12 +257,13 @@ rm ~/.claude/limit-watch/last_*
 
 Enquanto os watchers só olham os **percentuais** do `/usage`, o `token_monitor.py` lê os transcripts `.jsonl` que o Claude Code grava em `~/.claude/projects/`, agrega o uso em **SQLite** (`~/.claude/tools/token_usage.db`) e cruza com o medidor oficial. Sem dependências externas (só stdlib).
 
-Por convenção fica em `~/.claude/tools/token_monitor.py` (a cópia versionada é [`cnp/token_monitor.py`](cnp/token_monitor.py) — mantenha as duas em sincronia):
+Por convenção fica em `~/.claude/tools/token_monitor.py` (a cópia versionada é [`cnp/token_monitor.py`](cnp/token_monitor.py) — mantenha as duas em sincronia). Use o [`deploy.sh`](deploy.sh), que valida (`py_compile`) antes de copiar e dá `chmod +x`:
 
 ```bash
-cp cnp/token_monitor.py ~/.claude/tools/token_monitor.py
-chmod +x ~/.claude/tools/token_monitor.py   # permite a invocação direta `token_monitor.py gate` (shebang)
+./deploy.sh   # cnp/token_monitor.py → ~/.claude/tools/token_monitor.py (override: CLAUDE_TOOLS_DIR)
 ```
+
+> Reinicie qualquer `--watch` em execução após o deploy: um loop já rodando mantém o código antigo carregado em memória.
 
 ### Subcomandos
 
