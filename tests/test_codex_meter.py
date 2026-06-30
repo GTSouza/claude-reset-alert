@@ -77,5 +77,59 @@ class CodexMeterAlertsTest(unittest.TestCase):
         self.assertIsNone(event)
 
 
+class CodexWatchTickRefreshTest(unittest.TestCase):
+    """O tick do watch confirma ao vivo só quando um reset cruza — e uma vez por snapshot."""
+
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        self.con.execute(CREATE_CODEX_METER)
+
+    def tearDown(self):
+        self.con.close()
+
+    # epochs absolutos: "passado" e "futuro" são relativos ao now() real do código.
+    PAST, FUTURE = 1000, 10**12
+
+    def _snap(self, ts_epoch, session_reset_epoch, week_reset_epoch):
+        return {"ts_epoch": ts_epoch, "session_pct": 100, "session_reset_epoch": session_reset_epoch,
+                "week_pct": 100, "week_reset_epoch": week_reset_epoch, "plan": "plus"}
+
+    def test_refresh_fires_once_per_stale_snapshot(self):
+        # rollout antigo cujo reset semanal já cruzou (no passado, > ts) → precisa confirmar
+        stale = self._snap(ts_epoch=self.PAST, session_reset_epoch=self.FUTURE,
+                           week_reset_epoch=self.PAST + 500)
+        with patch.object(token_monitor, "read_codex_meter", return_value=stale), \
+             patch.object(token_monitor, "codex_live_refresh", return_value=("ok", None)) as live, \
+             patch.object(token_monitor, "codex_meter_once", return_value=True):
+            with contextlib.redirect_stdout(io.StringIO()):
+                tick = token_monitor._make_codex_tick(self.con, notify=False, auto_refresh=True)
+                tick(); tick(); tick()
+        # mesmo snapshot velho (codex exec falhou em produzir rollout novo) → gasta 1 turno só
+        self.assertEqual(live.call_count, 1)
+
+    def test_no_refresh_when_no_reset_crossed(self):
+        # ambos os resets no futuro → leitura ainda válida, não gasta turno
+        fresh = self._snap(ts_epoch=self.PAST, session_reset_epoch=self.FUTURE,
+                           week_reset_epoch=self.FUTURE)
+        with patch.object(token_monitor, "read_codex_meter", return_value=fresh), \
+             patch.object(token_monitor, "codex_live_refresh") as live, \
+             patch.object(token_monitor, "codex_meter_once", return_value=True):
+            with contextlib.redirect_stdout(io.StringIO()):
+                tick = token_monitor._make_codex_tick(self.con, notify=False, auto_refresh=True)
+                tick(); tick()
+        live.assert_not_called()
+
+    def test_no_refresh_without_auto_refresh(self):
+        stale = self._snap(ts_epoch=self.PAST, session_reset_epoch=self.FUTURE,
+                           week_reset_epoch=self.PAST + 500)
+        with patch.object(token_monitor, "read_codex_meter", return_value=stale), \
+             patch.object(token_monitor, "codex_live_refresh") as live, \
+             patch.object(token_monitor, "codex_meter_once", return_value=True):
+            with contextlib.redirect_stdout(io.StringIO()):
+                tick = token_monitor._make_codex_tick(self.con, notify=False, auto_refresh=False)
+                tick()
+        live.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

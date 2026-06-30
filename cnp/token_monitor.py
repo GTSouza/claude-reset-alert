@@ -1161,6 +1161,33 @@ def codex_meter_once(con: sqlite3.Connection, notify: bool = True, as_json: bool
     return True
 
 
+def _make_codex_tick(con: sqlite3.Connection, notify: bool, auto_refresh: bool):
+    """Fábrica do passo do Codex para os loops de watch.
+
+    Com auto_refresh (contexto de --watch), confirma ao vivo (1 turno MÍNIMO do
+    `codex exec`) UMA vez quando um reset cruza, ANTES de ler — senão o rollout fica
+    preso no % anterior ao reset (ele só se atualiza quando o Codex roda de fato).
+    O guard por ts_epoch garante "uma vez por snapshot": se o turno falhar (ou não
+    nascer rollout novo), o ts não muda e não regastamos cota a cada poll; quando o
+    refresh dá certo, nasce um rollout com ts/reset novos e o próximo reset volta a
+    disparar naturalmente. Sem auto_refresh é só leitura (igual antes)."""
+    confirmed_ts = set()
+
+    def tick() -> bool:
+        if auto_refresh:
+            m = read_codex_meter()
+            need, why = _codex_refresh_needed(m)
+            ts = (m or {}).get("ts_epoch")
+            if need and ts not in confirmed_ts:
+                confirmed_ts.add(ts)
+                print(f"… codex: confirmando ao vivo (turno mínimo do codex exec): {why}")
+                st, _ = codex_live_refresh()
+                print(f"  codex exec: {st}")
+        return codex_meter_once(con, notify=notify)
+
+    return tick
+
+
 def codex_meter_report(con: sqlite3.Connection, args) -> None:
     rows = con.execute(
         "SELECT ts, plan, session_pct, session_reset, week_pct, week_reset, event "
@@ -1755,10 +1782,14 @@ def main() -> None:
     elif args.cmd == "meter":
         notify = not args.no_notify
         with_codex = (not args.no_codex) and CODEX_SESSIONS_DIR.exists()
+        # no watch, confirma o Codex ao vivo quando um reset cruza (turno mínimo, 1x por
+        # snapshot); numa leitura avulsa fica só leitura (use `codex-meter --refresh`).
+        codex_tick = (_make_codex_tick(con, notify, auto_refresh=args.watch)
+                      if with_codex else None)
         def _meter_tick():
             ok = meter_once(con, notify=notify)
-            if with_codex:
-                codex_meter_once(con, notify=notify)
+            if codex_tick:
+                codex_tick()
             return ok
         if args.watch:
             _watch_loop("meter: /usage" + (" + codex" if with_codex else ""), args.interval, _meter_tick)
@@ -1769,7 +1800,8 @@ def main() -> None:
     elif args.cmd == "codex-meter":
         notify = not args.no_notify
         if args.watch:
-            _watch_loop("codex-meter", args.interval, lambda: codex_meter_once(con, notify=notify))
+            _watch_loop("codex-meter", args.interval,
+                        _make_codex_tick(con, notify, auto_refresh=True))
         else:
             if getattr(args, "refresh", False):
                 m0 = read_codex_meter()
