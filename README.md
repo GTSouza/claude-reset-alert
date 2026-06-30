@@ -272,9 +272,9 @@ Por convenção fica em `~/.claude/tools/token_monitor.py` (a cópia versionada 
 | `ingest` | Varre os `.jsonl` + `watch.log` e popula o banco (idempotente, incremental). |
 | `report` | Relatório agregado por janela (`--window 5h/day/week/month`) e eixo (`--by model/session/project/day/billing/none`). `--io-only` mostra só in/out (comparável ao app do Claude). |
 | `limits` | Episódios em que você bateu o limite. |
-| `meter` | Uma leitura do `/usage` do Claude (custo zero) — **e o Codex junto, se houver rollouts** (`--no-codex` desliga); grava na tabela `meter` e alerta reset/queda/cap. `--watch --interval 300` roda em loop. |
+| `meter` | Uma leitura do `/usage` do Claude (custo zero) — **e o Codex junto, se houver rollouts** (`--no-codex` desliga); grava na tabela `meter` e alerta reset/queda/cap. `--watch --interval 300` roda em loop (e confirma o Codex ao vivo quando um reset cruza, veja abaixo). |
 | `meter-report` | Histórico das leituras do medidor. |
-| `codex-meter` | Uma leitura do rate-limit do **Codex** a partir dos rollouts `~/.codex/sessions` (custo zero); grava na tabela `codex_meter` e alerta reset/queda/cap. `--watch --interval 300` roda em loop. |
+| `codex-meter` | Uma leitura do rate-limit do **Codex** a partir dos rollouts `~/.codex/sessions` (custo zero); grava na tabela `codex_meter` e alerta reset/queda/cap. `--watch --interval 300` roda em loop (e confirma ao vivo quando um reset cruza, veja abaixo). |
 | `codex-meter-report` | Histórico das leituras do medidor do Codex. |
 | `status` | Resumo num olhar: Claude + Codex (5h/semanal) + veredito do `gate --provider both`. |
 | **`gate`** | **Veredito GO/PAUSE de rate limit** para runners; `--provider {claude,codex,both}` (default `claude`) — ver abaixo. |
@@ -332,12 +332,12 @@ Além do Claude Code, o monitor mede o uso do **Codex CLI** — tudo **aditivo e
 
 A detecção compara cada rollout com o último snapshot cronológico já gravado: **reset** exige que o horário avance além de `RESET_TOLERANCE` **e que o percentual também mude**, **drop** exige queda acima de `DROP_THRESHOLD`, e **cap** ocorre quando a janela de 5h cruza 100%. Relê-lo no `--watch` é idempotente: um rollout estático nunca repete o mesmo alerta em polls posteriores. Cada evento dispara desktop + som + Telegram. O formato das mensagens é idêntico entre Claude e Codex — veja a seção acima para a lógica de ⚠️ em drops fora do horário de reset.
 
-#### Snapshot estático, inferência de reset e `--refresh`
+#### Snapshot estático, inferência de reset e confirmação ao vivo
 
 O rollout é um **snapshot da última vez que o Codex rodou** — não se atualiza sozinho (o `/status` da TUI mostra o mesmo dado, só parece "ao vivo" porque a sessão está ativa). Para não ficar preso num valor velho, o medidor faz duas coisas:
 
 - **Inferência de reset (no gate):** como `resets_at` é epoch absoluto, uma janela cujo reset já passou é tratada como recuperada (~0%) mesmo sem o Codex rodar. Sem isso, um `gate --provider codex` ficaria preso no % antigo para sempre e um runner gated em Codex nunca acordaria.
-- **Confirmação ao vivo (`codex-meter --refresh`):** gasta **1 turno mínimo** do `codex exec` para obter o número real, mas **só quando um reset já cruzou desde o rollout** (antes disso a leitura ainda é válida, pois sem o Codex rodar o uso não muda). `--force` gasta sempre. Use fora de um loop ativo quando quiser confirmar o reset em vez de só inferir.
+- **Confirmação ao vivo (1 turno mínimo):** gasta **1 turno mínimo** do `codex exec` para obter o número real, mas **só quando um reset já cruzou desde o rollout** (antes disso a leitura ainda é válida, pois sem o Codex rodar o uso não muda). Acontece **automaticamente nos loops `meter --watch` e `codex-meter --watch`** — **uma vez por snapshot** (se o turno falhar não regasta cota a cada poll) — para a leitura sair do valor preso (ex.: semanal em 100%) logo após o reset. Numa leitura avulsa, force com `codex-meter --refresh` (e `--force` gasta sempre, mesmo sem reset cruzado). O turno roda em `~` com `--skip-git-repo-check` (diretório não-trusted) e stdin fechado.
 
 #### Uso de tokens (`codex-report`)
 
