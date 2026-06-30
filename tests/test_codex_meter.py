@@ -1,7 +1,9 @@
 import contextlib
 import io
 import sqlite3
+import subprocess
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from cnp import token_monitor
@@ -129,6 +131,27 @@ class CodexWatchTickRefreshTest(unittest.TestCase):
                 tick = token_monitor._make_codex_tick(self.con, notify=False, auto_refresh=False)
                 tick()
         live.assert_not_called()
+
+
+class CodexLiveRefreshCommandTest(unittest.TestCase):
+    """Trava os flags do codex exec: ~ não é repo trusted e o stdin não pode herdar o TTY."""
+
+    def test_uses_skip_git_check_and_closed_stdin(self):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        with patch.object(token_monitor.shutil, "which", return_value="/usr/bin/codex"), \
+             patch.object(token_monitor.subprocess, "run", side_effect=fake_run), \
+             patch.object(token_monitor, "read_codex_meter", return_value=None):
+            status, _ = token_monitor.codex_live_refresh()
+
+        self.assertEqual(status, "ok")
+        self.assertIn("--skip-git-repo-check", captured["argv"])
+        self.assertEqual(captured["kwargs"].get("stdin"), subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

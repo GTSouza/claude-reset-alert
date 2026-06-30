@@ -1069,10 +1069,16 @@ def codex_live_refresh(timeout: int = 120):
     if not shutil.which("codex"):
         return ("codex ausente no PATH", None)
     try:
+        # --skip-git-repo-check: ~ não é repo git "trusted"; sem a flag o codex exec
+        # recusa (exit 1). stdin=DEVNULL: o codex exec concatena stdin ao prompt e
+        # travaria/lixaria a entrada herdando o TTY do --watch ("Reading additional
+        # input from stdin...").
         r = subprocess.run(
-            ["codex", "exec", "--sandbox", "read-only", "-C", os.path.expanduser("~"),
+            ["codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
+             "-C", os.path.expanduser("~"),
              "Não use ferramentas. Responda somente com: ok"],
             capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
         )
         status = "ok" if r.returncode == 0 else f"exit {r.returncode}"
     except subprocess.TimeoutExpired:
