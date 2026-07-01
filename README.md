@@ -264,6 +264,26 @@ Por convenção fica em `~/.claude/tools/token_monitor.py` (a cópia versionada 
 
 > Reinicie qualquer `--watch` em execução após o deploy: um loop já rodando mantém o código antigo carregado em memória.
 
+### Hooks do Claude Code (manter o banco fresco)
+
+Para o banco ficar sempre atual sem rodar nada à mão, o [`token_monitor_hook.sh`](token_monitor_hook.sh) roda o `ingest` nos eventos de sessão do Claude Code. O `deploy.sh` publica o wrapper junto do monitor em `~/.claude/tools/`.
+
+Ele só usa subcomandos **baratos e sem efeito colateral** — `ingest` (transcripts + billing + uso do Codex) e, no início da sessão, `codex-meter --no-notify` (snapshot do rollout do Codex, custo zero). **Nunca** usa `meter`/`gate`/`status`, que chamariam `claude -p /usage` (um `claude` aninhado por sessão). É **mudo** (toda saída vai para `/dev/null` — no `SessionStart` o stdout entraria no contexto) e **sempre sai 0** (um banco travado ou um `.jsonl` a meio de escrita viram no-op, nunca falham a sessão).
+
+Registre no `~/.claude/settings.json` (global) apontando para o wrapper publicado:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "~/.claude/tools/token_monitor_hook.sh SessionStart", "timeout": 60 }] }],
+    "Stop":         [{ "hooks": [{ "type": "command", "command": "~/.claude/tools/token_monitor_hook.sh Stop", "timeout": 45 }] }],
+    "PreCompact":   [{ "hooks": [{ "type": "command", "command": "~/.claude/tools/token_monitor_hook.sh PreCompact", "timeout": 45 }] }]
+  }
+}
+```
+
+Use o caminho absoluto do wrapper no `command`. O `SessionStart` mantém o banco fresco a cada início/retomada; o `Stop` captura o uso do turno que acabou; o `PreCompact` grava o estado antes da compactação. A leitura ao vivo do `/usage` do Claude continua sendo trabalho do `meter --watch` / dos watchers shell — os hooks não a substituem.
+
 ### Subcomandos
 
 | Comando | Para que serve |
