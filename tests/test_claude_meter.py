@@ -100,6 +100,123 @@ class MeterOnceRobustnessTest(unittest.TestCase):
         self.assertNotIn("⚠️", titles)
 
 
+class ResetClassificationTest(unittest.TestCase):
+    """Reset natural (no/depois do horário) x ANTECIPADO (Anthropic zerou antes do previsto),
+    e o reconfirm que separa reset real de glitch transitório."""
+
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        self.con.execute(CREATE_METER)
+        self.con.execute("CREATE TABLE usage (ts_epoch REAL, output_tokens INTEGER, model TEXT)")
+        import datetime as _dt
+        self.now = _dt.datetime.now(_dt.timezone.utc).timestamp()
+        self.s_re = tm._reset_to_epoch(S_RESET)   # horário NOVO (futuro, ~2 dias)
+        self.w_re = tm._reset_to_epoch(W_RESET)
+
+    def tearDown(self):
+        self.con.close()
+
+    def _prev(self, s_pct, s_re):
+        # janela semanal estável (mesmo % e horário) p/ isolar a 5h.
+        self.con.execute(
+            "INSERT INTO meter VALUES (?,?,?,?,?,?,?,?,?)",
+            ("prev", self.now - 300, s_pct, S_RESET, s_re, 71, W_RESET, self.w_re, None),
+        )
+
+    def _titles(self, notify):
+        return " || ".join(c.args[0] for c in notify.call_args_list)
+
+    def _event(self):
+        return self.con.execute("SELECT event FROM meter ORDER BY ts_epoch DESC LIMIT 1").fetchone()[0] or ""
+
+    WEEK_STABLE = f"Current week (all models): 71% used · resets {W_RESET}"
+
+    def test_natural_reset_on_schedule(self):
+        # horário previsto JÁ passou (now-1h) => reset no horário => natural, sem ANTECIPADO.
+        self._prev(99, self.now - 3600)
+        usage = f"Current session: 0% used · resets {S_RESET}\n" + self.WEEK_STABLE
+        with patch.object(tm, "_fetch_usage", return_value=usage), \
+             patch.object(tm, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                tm.meter_once(self.con, notify=False)
+        self.assertIn("reset_5h", self._event())
+        self.assertNotIn("_early", self._event())
+        t = self._titles(notify)
+        self.assertIn("resetou", t)
+        self.assertNotIn("ANTECIPADO", t)
+
+    def test_early_reset_before_schedule(self):
+        # horário previsto ainda no FUTURO (now+2h) mas a janela já zerou => ANTECIPADO.
+        self._prev(99, self.now + 7200)
+        usage = f"Current session: 0% used · resets {S_RESET}\n" + self.WEEK_STABLE
+        with patch.object(tm, "_fetch_usage", return_value=usage), \
+             patch.object(tm, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                tm.meter_once(self.con, notify=False)
+        self.assertIn("reset_5h_early", self._event())
+        self.assertIn("ANTECIPADO", self._titles(notify))
+
+    def test_early_reset_without_time_still_fires(self):
+        # reset ANTECIPADO em que o /usage veio degradado (0% + reset None) e assim persiste no
+        # reconfirm: mesmo sem horário novo, dispara reset_5h_early (o incidente real).
+        self._prev(99, self.now + 7200)
+        degraded = "Current session: 0% used\n" + self.WEEK_STABLE
+        with patch.object(tm, "_fetch_usage", return_value=degraded), \
+             patch.object(tm, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                tm.meter_once(self.con, notify=False)
+        self.assertIn("reset_5h_early", self._event())
+        self.assertIn("ANTECIPADO", self._titles(notify))
+
+    def test_reconfirm_cooldown_blocks_flapping(self):
+        # /usage oscilando degradado<->saudável não deve gastar 1 haiku por poll: o cooldown
+        # (marca 'reconfirm') bloqueia a 2ª releitura logo em seguida.
+        self._prev(90, self.s_re)
+        degraded = "Current session: 90% used\n" + self.WEEK_STABLE
+        healthy = f"Current session: 90% used · resets {S_RESET}\n" + self.WEEK_STABLE
+        # poll1: degraded -> reconfirm adota healthy (grava epoch não-nulo + marca reconfirm)
+        # poll2: degraded de novo -> p_sre não-nulo re-armaria, mas o cooldown bloqueia.
+        # 3 valores só: se o poll2 tentasse reconfirmar, faltaria um 4º (StopIteration).
+        with patch.object(tm, "_fetch_usage", side_effect=[degraded, healthy, degraded]) as fetch, \
+             patch.object(tm, "_notify"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                tm.meter_once(self.con, notify=False)
+                tm.meter_once(self.con, notify=False)
+        self.assertEqual(fetch.call_count, 3)   # poll1 main+reconfirm, poll2 main (sem reconfirm)
+        last = self.con.execute("SELECT event FROM meter ORDER BY ts_epoch DESC LIMIT 1").fetchone()[0] or ""
+        self.assertNotIn("reconfirm", last)     # 2º poll não reconfirmou (cooldown)
+
+    def test_partial_drop_flagged_far_after_reset(self):
+        # queda parcial (não zerou) 1h DEPOIS do reset previsto => ⚠️ (drop suspeito). O bug
+        # trocava o critério abs() por 'early' (só ANTES do horário), perdendo justamente este
+        # caso. Sem linha 'resets' (rep None) p/ cair no ramo de queda, não no de avanço de epoch.
+        self._prev(70, self.now - 3600)   # reset previsto foi 1h atrás (longe, depois)
+        degraded = "Current session: 40% used\n" + self.WEEK_STABLE
+        with patch.object(tm, "_fetch_usage", side_effect=[degraded, degraded]), \
+             patch.object(tm, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                tm.meter_once(self.con, notify=False)
+        self.assertIn("drop_5h", self._event())
+        self.assertIn("liberou", self._titles(notify))
+        self.assertIn("⚠️", self._titles(notify))
+
+    def test_reconfirm_recovers_glitch(self):
+        # glitch transitório: 1ª leitura 0%+reset None; o reconfirm traz de volta o valor ANTIGO
+        # (99% + MESMO horário) => adota, NÃO vira reset falso.
+        self._prev(99, self.s_re)   # horário anterior == horário que volta (glitch não muda o reset)
+        degraded = "Current session: 0% used\n" + self.WEEK_STABLE
+        healthy = f"Current session: 99% used · resets {S_RESET}\n" + self.WEEK_STABLE
+        with patch.object(tm, "_fetch_usage", side_effect=[degraded, healthy]), \
+             patch.object(tm, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                tm.meter_once(self.con, notify=False)
+        self.assertNotIn("reset", self._event())        # nenhum reset
+        self.assertNotIn("ANTECIPADO", self._titles(notify))
+        # e o valor recuperado (99%) foi o gravado, não o 0% do glitch
+        sp = self.con.execute("SELECT session_pct FROM meter ORDER BY ts_epoch DESC LIMIT 1").fetchone()[0]
+        self.assertEqual(sp, 99)
+
+
 class ResetToEpochTest(unittest.TestCase):
     """P1/P2: _reset_to_epoch tolera fuso da linha, 24h e forma relativa."""
 

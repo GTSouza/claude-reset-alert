@@ -98,6 +98,12 @@ METER_TZ = os.environ.get("METER_TZ", "America/Sao_Paulo")
 RESET_TOLERANCE = int(os.environ.get("RESET_TOLERANCE", "600"))   # s: "3pm" vs "2:59pm"
 DROP_THRESHOLD = int(os.environ.get("DROP_THRESHOLD", "5"))       # % de queda => cota liberou
 FETCH_RETRIES = int(os.environ.get("FETCH_RETRIES", "3"))
+# Reconfirma ao vivo uma leitura degradada (% sem horário de reset) antes de confiar nela;
+# METER_RECONFIRM=0 desliga (não faz a releitura barata do haiku).
+METER_RECONFIRM = os.environ.get("METER_RECONFIRM", "1") not in ("0", "false", "no", "")
+# Cooldown (s) entre releituras de confirmação: um /usage que OSCILA degradado<->saudável não
+# deve gastar 1 haiku por poll. Limita a ~1 releitura por janela (padrão 10min >> intervalo de poll).
+RECONFIRM_COOLDOWN = int(os.environ.get("RECONFIRM_COOLDOWN", "600"))
 # telegram.env do próprio limit-watch (mesmo arquivo, reaproveitado)
 TG_ENV_FILE = Path(os.environ.get("TG_ENV_FILE", str(Path.home() / ".claude" / "limit-watch" / "telegram.env")))
 
@@ -823,10 +829,13 @@ def _notify(title: str, msg: str, sound: str = "Glass", tg: bool = True) -> None
 
 def _meter_alert(provider: str, plan: str | None, kind: str, win: str,
                  pct, reset_txt, p_pct=None, n_tok: int | None = None,
-                 flagged: bool = False) -> tuple[str, str, str]:
+                 flagged: bool = False, early: bool = False,
+                 prev_reset: str | None = None) -> tuple[str, str, str]:
     """(title, msg, sound) padronizado p/ alertas de medidor (Claude e Codex iguais).
     kind: reset | drop | cap | credits ; win: '5h' | 'semanal'.
     flagged=True adiciona ⚠️ ao título (drop fora do horário de reset esperado).
+    early=True => reset ANTECIPADO (anormal): a Anthropic zerou a cota antes da janela
+    programada; prev_reset é o horário que estava previsto (p/ o texto 'era p/ ...').
     Título e msg usam HTML (Telegram parse_mode=HTML); _notify strip para console/macOS."""
     who = provider + (f" · {plan}" if plan else "")
     who_b = f"<b>{_html.escape(who)}</b>"
@@ -836,6 +845,12 @@ def _meter_alert(provider: str, plan: str | None, kind: str, win: str,
     def r(x):
         return round(x) if x is not None else 0
     if kind == "reset":
+        if early:
+            pr = _html.escape(re.sub(r"\s*\([^)]*\)\s*$", "", prev_reset or "").strip())
+            era = f" (era p/ {pr})" if pr else ""
+            return (f"🟠 {who_b} · {win} reset ANTECIPADO",
+                    f"Anthropic resetou antes do previsto{era} — nova janela {win}, "
+                    f"<b>{r(pct)}%</b> usado · reset {r_txt}", sound)
         return (f"🟢 {who_b} · {win} resetou",
                 f"Nova janela {win} — <b>{r(pct)}%</b> usado · reset {r_txt}", sound)
     if kind == "drop":
@@ -959,20 +974,55 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
         return False
     s_pct, s_reset = _parse_line(usage, "Current session")
     w_pct, w_reset = _parse_line(usage, "Current week")
-    # /usage passou no aceite (_fetch_usage) mas NENHUM percentual parseou (5h e semanal):
-    # não grava uma linha all-NULL. Ela poluiria o histórico (as subqueries <100/>=100
-    # tratam NULL como não-comparável) e reiniciaria a idade da leitura no gate sem trazer
-    # informação — deixando o runner em UNKNOWN por mais tempo. Some com a leitura ruim.
+
+    # estado anterior p/ detectar reset/queda — e p/ o reconfirm saber se ANTES havia horário.
+    prev = con.execute(
+        "SELECT session_pct, session_reset_epoch, week_pct, week_reset_epoch FROM meter ORDER BY ts_epoch DESC LIMIT 1"
+    ).fetchone()
+    p_spct, p_sre, p_wpct, p_wre = prev if prev else (None, None, None, None)
+
+    # RECONFIRM de leitura degradada: uma janela com % mas SEM horário de reset (reset None)
+    # aparece no momento de um reset — inclusive do RESET ANTECIPADO (a Anthropic zera a cota
+    # antes da janela programada). Visto ao vivo: 5h e semanal em 0% + reset None por ~20min.
+    # Como o /usage roda barato (haiku), refaz UMA leitura ao vivo p/ (a) recuperar o novo
+    # horário de reset e (b) separar um reset real de um glitch transitório — se a releitura
+    # trouxer de volta o valor ANTIGO não-zero, foi glitch e é adotado (não vira reset falso).
+    # Mesma ideia do reconfirm ao vivo do Codex. Dispara na TRANSIÇÃO bom->degradado (o poll
+    # anterior tinha horário). Uma degradação PLANA (0%+None persistente) grava epoch NULL e
+    # se desarma sozinha no próximo poll; mas um /usage que OSCILA (degradado<->saudável)
+    # re-armaria a cada poll — então um cooldown (RECONFIRM_COOLDOWN, marcado por 'reconfirm'
+    # na tabela) limita a ~1 releitura por janela de cooldown, mesmo oscilando.
+    def _degraded(pct, reset):
+        return pct is not None and reset is None
+    s_bad = _degraded(s_pct, s_reset) and p_sre is not None
+    w_bad = _degraded(w_pct, w_reset) and p_wre is not None
+    did_reconfirm = False
+    if METER_RECONFIRM and (s_bad or w_bad):
+        last_rc = con.execute("SELECT MAX(ts_epoch) FROM meter WHERE event LIKE '%reconfirm%'").fetchone()[0]
+        if last_rc is None or time.time() - last_rc >= RECONFIRM_COOLDOWN:
+            did_reconfirm = True
+            usage2 = _fetch_usage()
+            if usage2 is not None:
+                s2p, s2r = _parse_line(usage2, "Current session")
+                w2p, w2r = _parse_line(usage2, "Current week")
+                adopted = False
+                if s_bad and s2p is not None and s2r is not None:  # adota só releitura SAUDÁVEL
+                    s_pct, s_reset = s2p, s2r; adopted = True
+                if w_bad and w2p is not None and w2r is not None:
+                    w_pct, w_reset = w2p, w2r; adopted = True
+                print("🔁 releitura de confirmação do /usage"
+                      + (" — horário de reset recuperado." if adopted else " — ainda sem horário de reset."))
+
+    # /usage passou no aceite mas NENHUM percentual parseou (5h e semanal): não grava linha
+    # all-NULL. Ela poluiria o histórico (as subqueries <100/>=100 tratam NULL como não
+    # comparável) e reiniciaria a idade da leitura no gate sem trazer informação nova.
+    # NB: um reset (natural ou antecipado) chega como 0% — pct=0 NÃO é None e é preservado.
     if s_pct is None and w_pct is None:
         print("⚠️  /usage sem percentuais parseáveis (5h e semanal); leitura descartada.")
         return False
     now = datetime.now(timezone.utc)
     print(f"📊 5h: {s_pct}% usado · reset {s_reset}  |  semanal: {w_pct}% usado · reset {w_reset}")
 
-    # estado anterior p/ detectar reset (horário avançou) ou queda (% caiu)
-    prev = con.execute(
-        "SELECT session_pct, session_reset_epoch, week_pct, week_reset_epoch FROM meter ORDER BY ts_epoch DESC LIMIT 1"
-    ).fetchone()
     s_re = _reset_to_epoch(s_reset)
     w_re = _reset_to_epoch(w_reset)
     # Texto de reset presente mas não interpretável => alerta de reset/cap fica mudo.
@@ -985,23 +1035,38 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
     events = []
     if prev:
         p_spct, p_sre, p_wpct, p_wre = prev
-        for key, lbl, sound, pct, p_pct, rep, p_rep, reset_txt in (
+        for key, win, sound, pct, p_pct, rep, p_rep, reset_txt in (
             ("5h", "5h", "Ping", s_pct, p_spct, s_re, p_sre, s_reset),
-            ("week", "SEMANAL", "Submarine", w_pct, p_wpct, w_re, p_wre, w_reset),
+            ("week", "semanal", "Submarine", w_pct, p_wpct, w_re, p_wre, w_reset),
         ):
+            # ANTECIPADO (reset anormal): a janela renovou ANTES do horário previsto (p_rep) —
+            # a Anthropic zerou a cota fora da janela programada. Natural = no horário ou depois.
+            # p_rep None (horário anterior desconhecido) => não dá p/ classificar: trata como
+            # natural, sem o marcador de antecipado indevido.
+            early = p_rep is not None and now.timestamp() < p_rep - RESET_TOLERANCE
+            prev_reset_txt = _fmt_epoch(p_rep) if early else None
+            ev_reset = f"reset_{key}_early" if early else f"reset_{key}"
             # exige pct conhecido: um avanço de epoch com pct=None (parse falhou) não deve
-            # virar '🟢 resetou — 0% usado' e enganar um runner a retomar cedo demais.
+            # virar 'resetou — 0% usado' e enganar um runner a retomar cedo demais.
             if pct is not None and rep and p_rep and rep - p_rep > RESET_TOLERANCE:
-                events.append(f"reset_{key}")
-                _notify(*_meter_alert("Claude Code", None, "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
+                # reset com horário NOVO já conhecido (o /usage reporta o próximo reset).
+                events.append(ev_reset)
+                _notify(*_meter_alert("Claude Code", None, "reset", win, pct, reset_txt, early=early, prev_reset=prev_reset_txt), tg=notify)
             elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
-                events.append(f"drop_{key}")
-                # p_rep None = horário de reset anterior desconhecido (o texto não parseou
-                # no poll passado): não dá para saber se a queda coincide com o reset
-                # esperado, então NÃO marca a queda como suspeita — senão toda queda por
-                # reset normal, sob deriva de formato do /usage, viria com o ⚠️ indevido.
-                flagged = p_rep is not None and abs(now.timestamp() - p_rep) >= 1800
-                _notify(*_meter_alert("Claude Code", None, "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct, flagged=flagged), tg=notify)
+                if round(pct) == 0:
+                    # zerou = reset (natural ou antecipado); o horário pode ainda estar ausente
+                    # (reset ?) — o reconfirm tenta recuperá-lo, e se não vier, um poll saudável
+                    # seguinte preenche o horário na tabela.
+                    events.append(ev_reset)
+                    _notify(*_meter_alert("Claude Code", None, "reset", win, pct, reset_txt, early=early, prev_reset=prev_reset_txt), tg=notify)
+                else:
+                    # queda parcial (não zerou) = cota liberou, não é reset completo. Marca ⚠️
+                    # quando cai LONGE (±30min) do reset previsto — drop suspeito, fora da janela
+                    # (mesmo critério do Codex). p_rep None (horário anterior desconhecido) => não
+                    # marca, senão a deriva de formato viria com ⚠️ indevido.
+                    events.append(f"drop_{key}")
+                    far = p_rep is not None and abs(now.timestamp() - p_rep) >= 1800
+                    _notify(*_meter_alert("Claude Code", None, "drop", win, pct, reset_txt, p_pct, flagged=far), tg=notify)
 
         # (1) janela 5h ATINGIU 100% (transição <100 -> 100). Compara com a última leitura
         # de % NÃO-NULA (não só a linha imediatamente anterior): se o poll anterior falhou
@@ -1039,6 +1104,8 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
             events.append("credits_started")
             _notify(*_meter_alert("Claude Code", None, "credits", "5h", s_pct, s_reset, n_tok=tok), tg=notify)
 
+    if did_reconfirm:
+        events.append("reconfirm")          # marca p/ o cooldown do próximo poll
     con.execute(
         "INSERT OR REPLACE INTO meter VALUES (?,?,?,?,?,?,?,?,?)",
         (now.isoformat(), now.timestamp(), s_pct, s_reset, s_re, w_pct, w_reset, w_re,
