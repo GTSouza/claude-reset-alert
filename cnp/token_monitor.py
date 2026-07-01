@@ -1044,10 +1044,14 @@ def meter_report(con: sqlite3.Connection, args) -> None:
     print(f"\n=== Medidor oficial (/usage) — últimas {len(rows)} leituras ===\n")
     if not rows:
         print("(sem leituras — rode: token_monitor.py meter)\n"); return
-    print(f"{'quando (UTC)':<22}{'5h':>5}{'  reset 5h':<26}{'sem':>5}{'  reset semanal':<24}{'  evento'}")
-    print("-" * 100)
+    tzname = next((tz for _, _, sr, _, wr, _ in rows
+                   for tz in (_reset_disp(sr)[1], _reset_disp(wr)[1]) if tz), None)
+    if tzname:
+        print(f"(horários de reset no fuso {tzname})\n")
+    print(f"{'quando (UTC)':<22}{'5h':>5}{'  reset 5h':<20}{'sem':>5}{'  reset semanal':<20}{'  evento'}")
+    print("-" * 92)
     for ts, sp, sr, wp, wr, ev in rows:
-        print(f"{ts[:19]:<22}{_pctstr(sp):>5}  {(sr or '?')[:22]:<24}{_pctstr(wp):>5}  {(wr or '?')[:20]:<22}{'  '+ev if ev else ''}")
+        print(f"{ts[:19]:<22}{_pctstr(sp):>5}  {_reset_disp(sr)[0]:<18}{_pctstr(wp):>5}  {_reset_disp(wr)[0]:<18}{'  '+ev if ev else ''}")
     print()
 
 
@@ -1094,6 +1098,19 @@ def _fmt_epoch(epoch) -> str | None:
 
 def _pctstr(x) -> str:
     return f"{round(x)}%" if x is not None else "?"
+
+
+def _reset_disp(s: str | None) -> tuple[str, str | None]:
+    """'Jun 15 at 9pm (America/Sao_Paulo)' -> ('Jun 15 at 9pm', 'America/Sao_Paulo').
+    Separa o fuso (redundante entre linhas — o mesmo p/ toda a conta) do horário, para
+    o relatório mostrar o horário INTEIRO em coluna estreita e citar o fuso uma vez só,
+    em vez de cortar o '(...)' no meio e esconder o fuso."""
+    if not s:
+        return "?", None
+    m = re.search(r"\(([^)]+)\)\s*$", s)
+    tz = m.group(1) if m else None
+    body = re.sub(r"\s*\([^)]*\)\s*$", "", s).strip()
+    return (body or "?"), tz
 
 
 def read_codex_meter(scan_files: int = 40):
@@ -1362,10 +1379,14 @@ def codex_meter_report(con: sqlite3.Connection, args) -> None:
     print(f"\n=== Medidor Codex (rollouts) — últimas {len(rows)} leituras ===\n")
     if not rows:
         print("(sem leituras — rode: token_monitor.py codex-meter)\n"); return
-    print(f"{'quando (UTC)':<22}{'plano':<7}{'5h':>6}{'  reset 5h':<16}{'sem':>6}{'  reset semanal':<16}{'  evento'}")
-    print("-" * 94)
+    tzname = next((tz for _, _, _, sr, _, wr, _ in rows
+                   for tz in (_reset_disp(sr)[1], _reset_disp(wr)[1]) if tz), None)
+    if tzname:
+        print(f"(horários de reset no fuso {tzname})\n")
+    print(f"{'quando (UTC)':<22}{'plano':<7}{'5h':>6}{'  reset 5h':<20}{'sem':>6}{'  reset semanal':<20}{'  evento'}")
+    print("-" * 100)
     for ts, plan, sp, sr, wp, wr, ev in rows:
-        print(f"{ts[:19]:<22}{(plan or '?'):<7}{_pctstr(sp):>6}  {(sr or '?')[:14]:<16}{_pctstr(wp):>6}  {(wr or '?')[:14]:<16}{'  '+ev if ev else ''}")
+        print(f"{ts[:19]:<22}{(plan or '?'):<7}{_pctstr(sp):>6}  {_reset_disp(sr)[0]:<18}{_pctstr(wp):>6}  {_reset_disp(wr)[0]:<18}{'  '+ev if ev else ''}")
     print()
 
 
@@ -1825,12 +1846,16 @@ def codex_report(con: sqlite3.Connection, args) -> None:
             "model": "model",
             "none": "'GLOBAL'",
         }.get(args.by, "session_id")
+    # Filtra por ended_epoch (último evento) e não por started_epoch: uma sessão longa
+    # aberta ANTES da janela mas ainda ativa DENTRO dela produziu tokens no período e
+    # não pode sumir do relatório. Ressalva: codex_usage é 1 linha/sessão com totais
+    # CUMULATIVOS, então uma sessão que cruza a borda atribui todo o acumulado à janela.
     rows = con.execute(f"""
         SELECT {group} AS g,
                SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
                SUM(reasoning_output_tokens), SUM(total_tokens),
                SUM(MAX(ended_epoch - started_epoch, 0)), COUNT(*)
-        FROM codex_usage WHERE started_epoch >= ?
+        FROM codex_usage WHERE COALESCE(ended_epoch, started_epoch) >= ?
         GROUP BY g ORDER BY SUM(total_tokens) DESC
     """, group_params + [since_epoch]).fetchall()
     print(f"\n=== Uso do Codex — {label} — por {args.by} ===\n")
