@@ -1657,19 +1657,32 @@ def calibrate(con: sqlite3.Connection, args) -> None:
         factors = {m: round(max(0.0, f[i]), 4) for i, m in enumerate(models)}
         # diagnóstico: erro por episódio com os fatores novos
         print(f"\n=== Fatores resolvidos ({len(eps)} episódios, {len(models)} modelos, ridge λ={lam:.3g}) ===\n")
+        if len(eps) < len(models):
+            # Menos episódios que modelos => sistema indeterminado: só a regularização (λ)
+            # torna resolvível e os fatores tendem a ~1.0 sem separar os modelos.
+            print(f"⚠️  {len(eps)} episódios < {len(models)} modelos: sistema indeterminado; "
+                  f"fatores de baixa alavancagem serão mantidos em 1.0 (≈nominal).\n")
         # leverage de cada modelo (quanto $ ele aporta no total) p/ sinalizar confiança
         lev = {m: sum(A[r][i] for r in range(len(A))) for i, m in enumerate(models)}
         totlev = sum(lev.values()) or 1.0
+        # Modelos que a janela não consegue separar (peso <= 10%): o fator "aprendido" é
+        # dominado pelo puxão de λ para 1.0 — gravá-lo fingiria uma calibração que não houve.
+        # Mantém-se em 1.0 (nominal) no --apply, em vez de escrever um número sem lastro.
+        low_lev = {m for m in models if lev[m] / totlev <= 0.1}
         for m in models:
-            conf = "alta" if lev[m] / totlev > 0.3 else ("média" if lev[m] / totlev > 0.1 else "BAIXA (≈nominal)")
+            conf = "alta" if lev[m] / totlev > 0.3 else ("média" if lev[m] / totlev > 0.1 else "BAIXA (mantido 1.0)")
             print(f"  {m:<22} fator={factors[m]:.3f}   peso nos dados={lev[m]/totlev*100:4.1f}%  confiança={conf}")
         for r, (usd, _toks) in enumerate(eps):
             est = sum(A[r][i] * factors[models[i]] for i in range(len(models)))
             err = f"{abs(est - usd) / usd * 100:.1f}%" if usd else "— (real US$0)"
             print(f"  · episódio {r+1}: estimado US${est:.2f} vs real US${usd:.2f}  (erro {err})")
         if args.apply:
-            FACTORS_PATH.write_text(json.dumps(factors, indent=2))
-            print(f"\n✅ aplicado em {FACTORS_PATH}")
+            # não grava fator de baixa alavancagem: mantém 1.0 (nominal) p/ esses modelos.
+            applied = {m: (1.0 if m in low_lev else factors[m]) for m in models}
+            FACTORS_PATH.write_text(json.dumps(applied, indent=2))
+            held = ", ".join(sorted(low_lev))
+            note = f" (mantidos em 1.0: {held})" if held else ""
+            print(f"\n✅ aplicado em {FACTORS_PATH}{note}")
         else:
             print("\n(rode com --apply para gravar; senão é só simulação)")
         print()
