@@ -6,6 +6,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)/cnp/token_monitor.py"
 DEST="${CLAUDE_TOOLS_DIR:-$HOME/.claude/tools}/token_monitor.py"
 
 python3 -m py_compile "$SRC"
+mkdir -p "$(dirname "$DEST")"   # cria ~/.claude/tools (ou CLAUDE_TOOLS_DIR) numa máquina nova
 cp "$SRC" "$DEST"
 chmod +x "$DEST"   # permite a invocação direta `token_monitor.py gate` (shebang)
 echo "deployed → $DEST"
