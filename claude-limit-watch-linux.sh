@@ -135,10 +135,12 @@ fetch_usage() {
 # Devolve vazio (e código !=0) se não conseguir interpretar.
 # "mon day year HH MM AMPM" -> epoch, cobrindo GNU date (Linux) e BSD date (macOS).
 _epoch_ymd() { # mon day year HH MM AMPM
-  if date --version >/dev/null 2>&1; then          # GNU date (Linux)
+  if date --version >/dev/null 2>&1; then          # GNU date (Linux): lê 12h e 24h
     date -d "$1 $2 $3 $4:$5 $6" +%s 2>/dev/null
-  else                                             # BSD date (macOS)
+  elif [[ -n "$6" ]]; then                         # BSD date (macOS): 12h com am/pm
     date -j -f "%b %d %Y %I:%M %p" "$1 $2 $3 $4:$5 $6" +%s 2>/dev/null
+  else                                             # BSD date: relógio de 24h (sem am/pm)
+    date -j -f "%b %d %Y %H:%M" "$1 $2 $3 $4:$5" +%s 2>/dev/null
   fi
 }
 
@@ -197,16 +199,16 @@ check_window() {
 
   # Reset por horário: só conta como nova janela se o instante avançou ALÉM da
   # tolerância. Assim "3pm" virar "2:59pm" (mesmo reset, arredondado) é ignorado,
-  # mas um salto real (~5h ou ~1 semana à frente) dispara. Se algum horário não
-  # for interpretável, caímos para a comparação literal de strings.
+  # mas um salto real (~5h ou ~1 semana à frente) dispara. Se algum horário NÃO for
+  # interpretável, NÃO alerta por diferença de texto — um arredondamento de minuto
+  # ("21:00" vs "20:59") viraria um "resetou ✅" falso. A queda do % (abaixo) ainda
+  # detecta o reset real (100% -> 0%), então nada crítico se perde.
   local reset_advanced=0
   if [[ -n "$reset" && -n "$prev_reset" && "$reset" != "$prev_reset" ]]; then
     local cur_e prev_e
     cur_e="$(reset_to_epoch "$reset")"; prev_e="$(reset_to_epoch "$prev_reset")"
     if [[ -n "$cur_e" && -n "$prev_e" ]]; then
       (( cur_e - prev_e > RESET_TOLERANCE )) && reset_advanced=1
-    else
-      reset_advanced=1
     fi
   fi
 

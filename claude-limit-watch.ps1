@@ -199,7 +199,9 @@ function Reset-ToDateTime($reset) {
   # cheia) jamais viraria '3:00pm', falhava o parse e disparava reset falso.
   if ($s -notmatch '(?i)\d:\d{2}(am|pm)$') { $s = $s -replace '(?i)(\d)(am|pm)$', '$1:00$2' }
   $s = "$s $((Get-Date).Year)"
-  $fmts = @('MMM d h:mmtt yyyy','MMM dd h:mmtt yyyy','MMM d hh:mmtt yyyy','MMM dd hh:mmtt yyyy')
+  # inclui formatos de 24h ('15:00') além dos 12h ('3:00pm') p/ tolerar deriva do /usage
+  $fmts = @('MMM d h:mmtt yyyy','MMM dd h:mmtt yyyy','MMM d hh:mmtt yyyy','MMM dd hh:mmtt yyyy',
+            'MMM d H:mm yyyy','MMM dd H:mm yyyy','MMM d HH:mm yyyy','MMM dd HH:mm yyyy')
   $ci = [System.Globalization.CultureInfo]::InvariantCulture
   $dt = [datetime]::MinValue
   foreach ($f in $fmts) {
@@ -222,16 +224,16 @@ function Check-Window($label, $key, $pct, $reset, $sound) {
 
   # Reset por horário: só conta como nova janela se o instante avançou ALÉM da
   # tolerância. Assim "3pm" virar "2:59pm" (mesmo reset, arredondado) é ignorado,
-  # mas um salto real (~5h ou ~1 semana à frente) dispara. Se algum horário não
-  # for interpretável, caímos para a comparação literal de strings.
+  # mas um salto real (~5h ou ~1 semana à frente) dispara. Se algum horário NÃO for
+  # interpretável, NÃO alerta por diferença de texto — um arredondamento de minuto
+  # ("21:00" vs "20:59") viraria um "resetou ✅" falso. A queda do % (abaixo) ainda
+  # detecta o reset real (100% -> 0%), então nada crítico se perde.
   $resetAdvanced = $false
   if ($reset -and $prevReset -and ($reset -ne $prevReset)) {
     $curE = Reset-ToDateTime $reset
     $prevE = Reset-ToDateTime $prevReset
     if ($null -ne $curE -and $null -ne $prevE) {
       if (($curE - $prevE).TotalSeconds -gt $ResetTolerance) { $resetAdvanced = $true }
-    } else {
-      $resetAdvanced = $true
     }
   }
 
