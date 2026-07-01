@@ -130,6 +130,11 @@ PRICING = {
 # em silêncio o custo de um flagship novo (ex.: um sucessor do fable no tier Sonnet = -70%).
 _UNPRICED_WARNED: set[str] = set()
 
+# Textos de reset do /usage já avisados (uma vez cada) por não serem interpretáveis pelo
+# _reset_to_epoch. Um formato novo que não parseia desliga os alertas de reset/cap em
+# silêncio (o núcleo da ferramenta) — o aviso torna a deriva de formato visível.
+_RESET_UNPARSED_WARNED: set[str] = set()
+
 
 def _norm_model(model: str | None) -> str:
     """Normaliza variantes ao modelo base p/ compartilhar preço/fator: o sufixo '[1m]'
@@ -880,22 +885,48 @@ def _parse_line(usage: str, prefix: str) -> tuple[int | None, str | None]:
     return pct, reset
 
 
+def _line_tz(s: str) -> str:
+    """Fuso reportado na própria linha do /usage ('(America/Sao_Paulo)'), se válido;
+    senão METER_TZ. A conta pode reportar num fuso diferente do METER_TZ do monitor —
+    ancorar o reset no fuso errado desloca o epoch pela diferença de offset (horas)."""
+    m = re.search(r"\(([^)]+)\)\s*$", s or "")
+    if m and ZoneInfo is not None:
+        try:
+            ZoneInfo(m.group(1))
+            return m.group(1)
+        except Exception:
+            pass
+    return METER_TZ
+
+
 def _reset_to_epoch(s: str | None) -> float | None:
-    """'Jun 10 at 3pm (America/Sao_Paulo)' -> epoch (na METER_TZ)."""
+    """'Jun 10 at 3pm (America/Sao_Paulo)' -> epoch (no fuso da própria linha).
+    Tolera relógio de 24h ('at 15:00'), sem minutos ('at 3pm') e a forma relativa
+    ('in 2 hours' / 'in 45 minutes') — resiliência à deriva de formato do /usage."""
     if not s or ZoneInfo is None:
         return None
-    s = re.sub(r"\s*\(.*\)$", "", s).strip()              # tira "(timezone)"
-    m = re.match(r"([A-Za-z]{3})\s+(\d{1,2})\s+at\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)", s, re.IGNORECASE)
+    tzname = _line_tz(s)
+    body = re.sub(r"\s*\(.*\)$", "", s).strip()          # tira "(timezone)"
+    # Forma relativa: "in N hour(s)/minute(s)" (ancorada em agora, sem fuso).
+    rel = re.match(r"in\s+(\d+)\s*(hour|hr|minute|min)", body, re.IGNORECASE)
+    if rel:
+        n = int(rel.group(1))
+        secs = n * (3600 if rel.group(2).lower().startswith(("hour", "hr")) else 60)
+        return datetime.now(timezone.utc).timestamp() + secs
+    # Forma absoluta: am/pm OPCIONAL — sem o token, hh é lido como relógio de 24h.
+    m = re.match(r"([A-Za-z]{3})\s+(\d{1,2})\s+at\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)?", body, re.IGNORECASE)
     if not m:
         return None
     mon, day, hh, mm, ap = m.groups()
     mon_n = _MONTHS.get(mon[:3].title())
     if not mon_n:
         return None
-    hh = int(hh) % 12 + (12 if ap.lower() == "pm" else 0)
+    hh = int(hh)
+    if ap:
+        hh = hh % 12 + (12 if ap.lower() == "pm" else 0)
     mm = int(mm) if mm else 0
     try:
-        tz = ZoneInfo(METER_TZ)
+        tz = ZoneInfo(tzname)
         now_local = datetime.now(tz)
         dt = datetime(now_local.year, mon_n, int(day), hh, mm, tzinfo=tz)
         # O /usage só reporta resets FUTUROS. Se ancorar no ano corrente jogou a data
@@ -916,6 +947,13 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
         return False
     s_pct, s_reset = _parse_line(usage, "Current session")
     w_pct, w_reset = _parse_line(usage, "Current week")
+    # /usage passou no aceite (_fetch_usage) mas NENHUM percentual parseou (5h e semanal):
+    # não grava uma linha all-NULL. Ela poluiria o histórico (as subqueries <100/>=100
+    # tratam NULL como não-comparável) e reiniciaria a idade da leitura no gate sem trazer
+    # informação — deixando o runner em UNKNOWN por mais tempo. Some com a leitura ruim.
+    if s_pct is None and w_pct is None:
+        print("⚠️  /usage sem percentuais parseáveis (5h e semanal); leitura descartada.")
+        return False
     now = datetime.now(timezone.utc)
     print(f"📊 5h: {s_pct}% usado · reset {s_reset}  |  semanal: {w_pct}% usado · reset {w_reset}")
 
@@ -925,6 +963,13 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
     ).fetchone()
     s_re = _reset_to_epoch(s_reset)
     w_re = _reset_to_epoch(w_reset)
+    # Texto de reset presente mas não interpretável => alerta de reset/cap fica mudo.
+    # Avisa uma vez por formato para tornar a deriva visível (ex.: novo layout do /usage).
+    for txt, epoch in ((s_reset, s_re), (w_reset, w_re)):
+        if txt and epoch is None and txt not in _RESET_UNPARSED_WARNED:
+            _RESET_UNPARSED_WARNED.add(txt)
+            print(f"⚠️  horário de reset não interpretável: {txt!r} — alertas de reset/cap "
+                  f"desta janela ficam mudos até o formato ser suportado.")
     events = []
     if prev:
         p_spct, p_sre, p_wpct, p_wre = prev
@@ -939,11 +984,22 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
                 _notify(*_meter_alert("Claude Code", None, "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
             elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
                 events.append(f"drop_{key}")
-                near_reset = p_rep is not None and abs(now.timestamp() - p_rep) < 1800
-                _notify(*_meter_alert("Claude Code", None, "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct, flagged=not near_reset), tg=notify)
+                # p_rep None = horário de reset anterior desconhecido (o texto não parseou
+                # no poll passado): não dá para saber se a queda coincide com o reset
+                # esperado, então NÃO marca a queda como suspeita — senão toda queda por
+                # reset normal, sob deriva de formato do /usage, viria com o ⚠️ indevido.
+                flagged = p_rep is not None and abs(now.timestamp() - p_rep) >= 1800
+                _notify(*_meter_alert("Claude Code", None, "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct, flagged=flagged), tg=notify)
 
-        # (1) janela 5h ATINGIU 100% (transição <100 -> 100)
-        if s_pct is not None and s_pct >= CREDIT_PCT and p_spct is not None and p_spct < CREDIT_PCT:
+        # (1) janela 5h ATINGIU 100% (transição <100 -> 100). Compara com a última leitura
+        # de % NÃO-NULA (não só a linha imediatamente anterior): se o poll anterior falhou
+        # o parse do 5h (session_pct NULL), a transição <100->100 ainda é detectada e o
+        # alerta de cap não some.
+        last_spct_row = con.execute(
+            "SELECT session_pct FROM meter WHERE session_pct IS NOT NULL ORDER BY ts_epoch DESC LIMIT 1"
+        ).fetchone()
+        last_spct = last_spct_row[0] if last_spct_row else None
+        if s_pct is not None and s_pct >= CREDIT_PCT and last_spct is not None and last_spct < CREDIT_PCT:
             events.append("cap_5h")
             _notify(*_meter_alert("Claude Code", None, "cap", "5h", s_pct, s_reset), tg=notify)
 
@@ -1245,8 +1301,10 @@ def codex_meter_once(con: sqlite3.Connection, notify: bool = True, as_json: bool
                 _notify(*_meter_alert("Codex", m.get("plan"), "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
             elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
                 events.append(f"drop_{key}")
-                near_reset = p_rep is not None and abs(ts_epoch - p_rep) < 1800
-                _notify(*_meter_alert("Codex", m.get("plan"), "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct, flagged=not near_reset), tg=notify)
+                # p_rep None = reset anterior desconhecido: não dá para dizer se a queda
+                # coincide com o reset esperado, então NÃO marca como suspeita (⚠️).
+                flagged = p_rep is not None and abs(ts_epoch - p_rep) >= 1800
+                _notify(*_meter_alert("Codex", m.get("plan"), "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct, flagged=flagged), tg=notify)
         if s_pct is not None and s_pct >= CREDIT_PCT and p_spct is not None and p_spct < CREDIT_PCT:
             events.append("cap_5h")
             _notify(*_meter_alert("Codex", m.get("plan"), "cap", "5h", s_pct, s_reset), tg=notify)
