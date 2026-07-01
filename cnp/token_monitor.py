@@ -348,9 +348,11 @@ def ingest(con: sqlite3.Connection, verbose: bool = True) -> tuple[int, int]:
 
 
 # Linha do watch.log: "YYYY-MM-DD HH:MM:SS  📊 5h: N% usado · reset R1  |  semanal: M% usado · reset R2"
+# reset (.*?) e não (.+?): quando o /usage não traz o "resets ..." o watcher loga
+# "... reset  | ..." — os PERCENTUAIS ainda são válidos e não devem ser descartados.
 _WATCHLOG_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+📊 5h:\s*(\d+)% usado · reset (.+?)\s+\|\s+"
-    r"semanal:\s*(\d+)% usado · reset (.+?)\s*$"
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+📊 5h:\s*(\d+)% usado · reset\s*(.*?)\s*\|\s+"
+    r"semanal:\s*(\d+)% usado · reset\s*(.*?)\s*$"
 )
 WATCHLOG_PATH = Path(os.environ.get("WATCHLOG_PATH", str(Path.home() / ".claude" / "limit-watch" / "watch.log")))
 
@@ -625,6 +627,10 @@ def report(con: sqlite3.Connection, args) -> None:
     # As mesmas colunas existem em `usage` e `limits`, então o WHERE serve aos dois.
     where = ["ts_epoch >= ?"]
     params: list = [since_epoch]
+    # Batidas de limite são da CONTA (o banner de cap não carrega o modelo filtrado de
+    # forma confiável), então a contagem ignora --model — mantém só janela/sessão/projeto.
+    lim_where = ["ts_epoch >= ?"]
+    lim_params: list = [since_epoch]
     for name, val, clause, param in (
         ("model", args.model, "model = ?", args.model),
         ("session", args.session, "session_id LIKE ?", f"{args.session}%"),
@@ -633,7 +639,10 @@ def report(con: sqlite3.Connection, args) -> None:
         if val:
             where.append(clause); params.append(param)
             label += f" [{name}={val}]"
+            if name != "model":
+                lim_where.append(clause); lim_params.append(param)
     where_sql = " AND ".join(where)
+    lim_where_sql = " AND ".join(lim_where)
 
     # SEMPRE agrupamos por (grupo, model) no SQL para que o custo use o preço
     # certo de cada modelo. As sub-linhas são somadas por grupo de exibição no
@@ -681,7 +690,9 @@ def report(con: sqlite3.Connection, args) -> None:
             for k in tot:
                 tot[k] += d[k]
         print("-" * len(header))
-        print(f"{'TOTAL':<34} {fmt(tot['in']):>12} {fmt(tot['out']):>12} {'100.0%':>7} {tot['msgs']:>6}")
+        # % do TOTAL derivado dos dados (100.0% quando há output; 0.0% quando não há),
+        # em vez de fixar '100.0%' — que enganava numa janela sem nenhum output.
+        print(f"{'TOTAL':<34} {fmt(tot['in']):>12} {fmt(tot['out']):>12} {tot['out'] / tot_out * 100:>6.1f}% {tot['msgs']:>6}")
         print(f"\nTotal in+out: {fmt(tot['in'] + tot['out'])}  (o app mostra estes números, não o cache)\n")
         return
 
@@ -700,8 +711,9 @@ def report(con: sqlite3.Connection, args) -> None:
           f"{fmt(tot['cread']):>13} {fmt(tot['cwrite']):>12} {tot['msgs']:>6} {tot['usd']:>9.2f}")
     grand = tot["in"] + tot["out"] + tot["cread"] + tot["cwrite"]
     print(f"\nTotal de tokens (todos os tipos): {fmt(grand)}")
-    nlim = con.execute(f"SELECT COUNT(*) FROM limits WHERE {where_sql}", params).fetchone()[0]
-    print(f"Batidas de limite nesta janela: {nlim}\n")
+    nlim = con.execute(f"SELECT COUNT(*) FROM limits WHERE {lim_where_sql}", lim_params).fetchone()[0]
+    note = " (da conta, ignora --model)" if args.model else ""
+    print(f"Batidas de limite nesta janela{note}: {nlim}\n")
 
 
 def limits(con: sqlite3.Connection, args) -> None:
@@ -1632,8 +1644,8 @@ def calibrate(con: sqlite3.Connection, args) -> None:
             print(f"  {m:<22} fator={factors[m]:.3f}   peso nos dados={lev[m]/totlev*100:4.1f}%  confiança={conf}")
         for r, (usd, _toks) in enumerate(eps):
             est = sum(A[r][i] * factors[models[i]] for i in range(len(models)))
-            err = abs(est - usd) / usd * 100 if usd else float("nan")
-            print(f"  · episódio {r+1}: estimado US${est:.2f} vs real US${usd:.2f}  (erro {err:.1f}%)")
+            err = f"{abs(est - usd) / usd * 100:.1f}%" if usd else "— (real US$0)"
+            print(f"  · episódio {r+1}: estimado US${est:.2f} vs real US${usd:.2f}  (erro {err})")
         if args.apply:
             FACTORS_PATH.write_text(json.dumps(factors, indent=2))
             print(f"\n✅ aplicado em {FACTORS_PATH}")
@@ -1643,9 +1655,18 @@ def calibrate(con: sqlite3.Connection, args) -> None:
         return
 
     # registro de um episódio: --brl ou --usd, janela = último credit_episode ou --from/--to
-    real_usd = args.usd if args.usd is not None else (args.brl / args.rate if args.brl is not None else None)
-    if real_usd is None:
+    if args.usd is not None:
+        real_usd = args.usd
+    elif args.brl is not None:
+        if not args.rate or args.rate <= 0:
+            print("--rate deve ser > 0 (câmbio US$/R$)."); return
+        real_usd = args.brl / args.rate
+        if abs(args.rate - 5.9) < 1e-9:
+            print("⚠️  usando --rate default 5.9 (US$/R$); passe o câmbio do dia p/ mais precisão.")
+    else:
         print("informe --usd <X> ou --brl <Y> (com --rate, default 5.9)"); return
+    if real_usd <= 0:
+        print("gasto real deve ser > 0 (--usd/--brl positivos)."); return
     if args.from_ and args.to:
         a = datetime.fromisoformat(args.from_).replace(tzinfo=timezone.utc).timestamp()
         b = datetime.fromisoformat(args.to).replace(tzinfo=timezone.utc).timestamp()
