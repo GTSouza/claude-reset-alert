@@ -331,7 +331,7 @@ Além do Claude Code, o monitor mede o uso do **Codex CLI** — tudo **aditivo e
 ~/.claude/tools/token_monitor.py codex-meter-report   # histórico (tabela codex_meter)
 ```
 
-A detecção compara cada rollout com o último snapshot cronológico já gravado: **reset** exige que o horário avance além de `RESET_TOLERANCE` **e que o percentual também mude**, **drop** exige queda acima de `DROP_THRESHOLD`, e **cap** ocorre quando a janela de 5h cruza 100%. Relê-lo no `--watch` é idempotente: um rollout estático nunca repete o mesmo alerta em polls posteriores. Cada evento dispara desktop + som + Telegram. O formato das mensagens é idêntico entre Claude e Codex — veja a seção acima para a lógica de ⚠️ em drops fora do horário de reset.
+A detecção compara cada rollout com o último snapshot cronológico já gravado: **reset** ocorre quando o horário (`resets_at`, um instante absoluto estável na janela) avança além de `RESET_TOLERANCE` — mesmo que o percentual não mude (janela re-saturada 100%→100% no reset); a idempotência vem de comparar sempre com o snapshot de mesmo `ts_epoch`, não de exigir mudança de %. **drop** exige queda acima de `DROP_THRESHOLD`, e **cap** ocorre quando a janela de 5h cruza 100%. Relê-lo no `--watch` é idempotente: um rollout estático nunca repete o mesmo alerta em polls posteriores. Cada evento dispara desktop + som + Telegram. O formato das mensagens é idêntico entre Claude e Codex — veja a seção acima para a lógica de ⚠️ em drops fora do horário de reset.
 
 #### Snapshot estático, inferência de reset e confirmação ao vivo
 
