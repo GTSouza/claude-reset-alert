@@ -106,13 +106,29 @@ TG_ENV_FILE = Path(os.environ.get("TG_ENV_FILE", str(Path.home() / ".claude" / "
 # fator é APRENDIDO dos seus gastos reais de crédito (comando `calibrate`). Modelo sem
 # dado real fica com fator 1.0 (nominal) — ver `calibrate --solve`.
 PRICING = {
+    # Flagship (fable-tier) — mythos-5 (Project Glasswing) tem preço idêntico ao fable-5.
     "claude-fable-5":         {"in": 10.0, "out": 50.0, "cache_read": 1.00, "cache_write": 12.50},
+    "claude-mythos-5":        {"in": 10.0, "out": 50.0, "cache_read": 1.00, "cache_write": 12.50},
+    # Opus-tier
     "claude-opus-4-8":        {"in": 5.0,  "out": 25.0, "cache_read": 0.50, "cache_write": 6.25},
     "claude-opus-4-7":        {"in": 5.0,  "out": 25.0, "cache_read": 0.50, "cache_write": 6.25},
+    "claude-opus-4-6":        {"in": 5.0,  "out": 25.0, "cache_read": 0.50, "cache_write": 6.25},
+    "claude-opus-4-5":        {"in": 5.0,  "out": 25.0, "cache_read": 0.50, "cache_write": 6.25},
+    # Sonnet-tier — sonnet-5 tem preço promo 2/10 até 2026-08-31 (NÃO modelado aqui;
+    # base fica no padrão 3/15, então sonnet-5 é super-estimado ~33% até lá).
+    "claude-sonnet-5":        {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75},
     "claude-sonnet-4-6":      {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75},
+    "claude-sonnet-4-5":      {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75},
+    # Haiku-tier
     "claude-haiku-4-5":       {"in": 1.0,  "out": 5.0,  "cache_read": 0.10, "cache_write": 1.25},
+    # Fallback p/ modelo real não listado: tier Sonnet. É PROPOSITALMENTE conservador
+    # (não opus-tier), mas base_cost avisa 1x por ID p/ o gap não passar em silêncio.
     "_default":               {"in": 3.0,  "out": 15.0, "cache_read": 0.30, "cache_write": 3.75},
 }
+
+# IDs 'claude-*' já avisados (uma vez cada) por caírem no _default. Evita subnotificar
+# em silêncio o custo de um flagship novo (ex.: um sucessor do fable no tier Sonnet = -70%).
+_UNPRICED_WARNED: set[str] = set()
 
 
 def _norm_model(model: str | None) -> str:
@@ -521,7 +537,16 @@ WINDOWS = {
 
 def base_cost(model: str | None, r: dict) -> float:
     """Custo NOMINAL (sem o fator de calibração)."""
-    p = PRICING.get(_norm_model(model)) or PRICING["_default"]
+    key = _norm_model(model)
+    p = PRICING.get(key)
+    if p is None:
+        # Modelo real sem preço: usa _default mas AVISA (uma vez por ID). Sem isto, um
+        # flagship novo caindo no tier Sonnet subnotificaria o custo em até ~70% sem sinal.
+        if is_real_model(model) and key not in _UNPRICED_WARNED:
+            _UNPRICED_WARNED.add(key)
+            print(f"⚠️  modelo sem preço em PRICING: {key} — usando _default (custo pode "
+                  f"estar subnotificado). Adicione-o a PRICING.", file=sys.stderr)
+        p = PRICING["_default"]
     return (
         r["in"] / 1e6 * p["in"]
         + r["out"] / 1e6 * p["out"]
@@ -531,9 +556,10 @@ def base_cost(model: str | None, r: dict) -> float:
 
 
 def cost(model: str | None, r: dict) -> float:
-    """Custo calibrado = base × fator do modelo (1.0 se não calibrado)."""
-    factor = FACTORS.get(model, FACTORS.get(_norm_model(model), 1.0))
-    return base_cost(model, r) * factor
+    """Custo calibrado = base × fator do modelo NORMALIZADO (1.0 se não calibrado).
+    O fator é gravado por _norm_model, então variantes '[1m]'/datadas do mesmo modelo
+    compartilham um único fator — consistente com base_cost e com calibrate --solve."""
+    return base_cost(model, r) * FACTORS.get(_norm_model(model), 1.0)
 
 
 def _cost_row(t: dict) -> dict:
@@ -1479,14 +1505,17 @@ def bursts_report(con: sqlite3.Connection, args) -> None:
 # fatores. Modelo pouco presente fica perto de 1.0 (nominal) — honesto, sem chute.
 
 def _episode_tokens(con: sqlite3.Connection, a: float, b: float) -> dict:
-    """Soma tokens por modelo numa janela [a,b] (epoch). {model: {in,out,cr,cw}}."""
-    out = {}
+    """Soma tokens por modelo NORMALIZADO numa janela [a,b] (epoch). {model: {in,out,cr,cw}}.
+    Normaliza ('[1m]'/datadas -> base) p/ colapsar variantes do MESMO modelo num só fator;
+    senão a calibração racha a alavancagem de um modelo em colunas colineares (baixa confiança)."""
+    out: dict[str, dict] = {}
     for m, i, o, cr, cw in con.execute(
         f"SELECT model, SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write) "
         f"FROM usage WHERE ts_epoch > ? AND ts_epoch <= ? AND {REAL_MODEL_SQL} GROUP BY model",
         (a, b),
     ):
-        out[m] = {"in": i or 0, "out": o or 0, "cr": cr or 0, "cw": cw or 0}
+        d = out.setdefault(_norm_model(m), {"in": 0, "out": 0, "cr": 0, "cw": 0})
+        d["in"] += i or 0; d["out"] += o or 0; d["cr"] += cr or 0; d["cw"] += cw or 0
     return out
 
 
@@ -1524,13 +1553,22 @@ def calibrate(con: sqlite3.Connection, args) -> None:
 
     # --solve [--apply]
     if args.solve:
-        eps = con.execute("SELECT real_usd, tokens_json FROM calibration").fetchall()
-        if not eps:
+        rows = con.execute("SELECT real_usd, tokens_json FROM calibration").fetchall()
+        if not rows:
             print("(sem episódios — registre com: calibrate --brl <valor> [--from .. --to ..])"); return
-        models = sorted({m for _, tj in eps for m in json.loads(tj)})
+        # Colapsa variantes ('[1m]'/datadas) do MESMO modelo num só fator — inclusive
+        # episódios ANTIGOS gravados com o ID cru — p/ 1 modelo = 1 coluna/fator.
+        def _norm_toks(tj):
+            merged: dict = {}
+            for m, t in json.loads(tj).items():
+                d = merged.setdefault(_norm_model(m), {"in": 0, "out": 0, "cr": 0, "cw": 0})
+                for k in ("in", "out", "cr", "cw"):
+                    d[k] += t.get(k, 0)
+            return merged
+        eps = [(usd, _norm_toks(tj)) for usd, tj in rows]
+        models = sorted({m for _, toks in eps for m in toks})
         A, b = [], []
-        for usd, tj in eps:
-            toks = json.loads(tj)
+        for usd, toks in eps:
             row = [base_cost(m, _cost_row(toks.get(m, {}))) for m in models]
             A.append(row); b.append(usd)
         lam = max(1e-6, 0.02 * max((A[r][c] for r in range(len(A)) for c in range(len(models))), default=1.0))
@@ -1544,7 +1582,7 @@ def calibrate(con: sqlite3.Connection, args) -> None:
         for m in models:
             conf = "alta" if lev[m] / totlev > 0.3 else ("média" if lev[m] / totlev > 0.1 else "BAIXA (≈nominal)")
             print(f"  {m:<22} fator={factors[m]:.3f}   peso nos dados={lev[m]/totlev*100:4.1f}%  confiança={conf}")
-        for r, (usd, tj) in enumerate(eps):
+        for r, (usd, _toks) in enumerate(eps):
             est = sum(A[r][i] * factors[models[i]] for i in range(len(models)))
             err = abs(est - usd) / usd * 100 if usd else float("nan")
             print(f"  · episódio {r+1}: estimado US${est:.2f} vs real US${usd:.2f}  (erro {err:.1f}%)")
@@ -1655,31 +1693,39 @@ def codex_report(con: sqlite3.Connection, args) -> None:
 
 
 def status(con: sqlite3.Connection, args) -> None:
-    """Resumo de um olhar: Claude + Codex (5h/semanal) + veredito do gate (both)."""
+    """Resumo de um olhar: Claude + Codex (5h/semanal) + veredito do gate (both).
+
+    Usa o MESMO caminho de leitura do gate (_claude_reading refaz se a leitura estiver
+    velha; _codex_reading infere reset) e a MESMA regra de veredito — assim status e
+    gate nunca discordam. Sem leitura válida => UNKNOWN (trate como PAUSE), nunca GO.
+    Cada pct é comparado com guarda de None (um bucket ausente não derruba o comando)."""
     g5 = getattr(args, "max_5h", 80); gw = getattr(args, "max_week", 90)
-    row = _latest_meter(con)
-    cm = read_codex_meter()
+    cl = _claude_reading(con, args)
+    co = _codex_reading(args)
     print(f"\n=== Status — Claude + Codex (gate 5h<{g5}% · semanal<{gw}%) ===\n")
+
     pauses = []
-    if row and row[1] is not None:
-        _, sp, sr, wp, wr = row
-        if sp >= g5 or wp >= gw: pauses.append("claude")
-        flag = "  🛑" if "claude" in pauses else ""
-        print(f"📊 Claude   5h: {_pctstr(sp)} · reset {sr}   |   semanal: {_pctstr(wp)} · reset {wr}{flag}")
+    any_valid = False
+    for rd, name, label in ((cl, "claude", "Claude"), (co, "codex", "Codex ")):
+        sp, wp = rd["session_pct"], rd["week_pct"]
+        if sp is None or wp is None:
+            print(f"📊 {label}   (sem leitura — {rd['source']})")
+            continue
+        any_valid = True
+        hot = sp >= g5 or wp >= gw
+        if hot:
+            pauses.append(name)
+        flag = "  🛑" if hot else ""
+        print(f"📊 {label}   5h: {_pctstr(sp)} · reset {rd['session_reset']}   |   "
+              f"semanal: {_pctstr(wp)} · reset {rd['week_reset']}{flag}   [{rd['source']}]")
+
+    if not any_valid:
+        dec, icon, tail = "UNKNOWN", "⚠️ ", " — sem leitura válida (conservador: trate como PAUSE)"
+    elif pauses:
+        dec, icon, tail = "PAUSE", "🛑", f" — estourado: {', '.join(pauses)}"
     else:
-        print("📊 Claude   (sem leitura — rode: token_monitor.py meter)")
-    if cm and cm.get("session_pct") is not None:
-        rd = _codex_reading(args)              # mesma inferência de reset do gate
-        sp = rd["session_pct"]; wp = rd["week_pct"]
-        if sp >= g5 or wp >= gw: pauses.append("codex")
-        flag = "  🛑" if "codex" in pauses else ""
-        print(f"📊 Codex    5h: {_pctstr(sp)} · reset {rd['session_reset']}   |   "
-              f"semanal: {_pctstr(wp)} · reset {rd['week_reset']}{flag}   [{cm['plan']}, {rd['source']}]")
-    else:
-        print("📊 Codex    (sem leitura de rollout)")
-    dec = "PAUSE" if pauses else "GO"
-    icon = "🛑" if pauses else "➡️ "
-    print(f"\n{icon} gate(both): {dec}" + (f" — estourado: {', '.join(pauses)}" if pauses else "") + "\n")
+        dec, icon, tail = "GO", "➡️ ", ""
+    print(f"\n{icon} gate(both): {dec}{tail}\n")
 
 
 def main() -> None:
@@ -1737,6 +1783,11 @@ def main() -> None:
     stp = sub.add_parser("status", help="resumo de um olhar: Claude + Codex (5h/semanal) + veredito do gate")
     stp.add_argument("--max-5h", dest="max_5h", type=int, default=80)
     stp.add_argument("--max-week", dest="max_week", type=int, default=90)
+    # Mesmos knobs de leitura do gate (status reaproveita _claude_reading/_codex_reading):
+    stp.add_argument("--max-age", dest="max_age", type=int, default=300,
+                     help="segundos: leitura mais velha que isto dispara medida ao vivo (default 300)")
+    stp.add_argument("--refresh", action="store_true", help="força leitura ao vivo do /usage agora")
+    stp.add_argument("--no-notify", action="store_true", help="não notificar ao refazer a leitura do medidor")
 
     gp = sub.add_parser("gate", help="veredito GO/PAUSE de rate limit (exit 0/10/2) p/ runners")
     gp.add_argument("--provider", choices=["claude", "codex", "both"], default="claude",

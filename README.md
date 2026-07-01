@@ -375,19 +375,24 @@ Com dois providers cada leitura é prefixada (`[claude]`/`[codex]`) e o `motivo:
 
 #### `status` — resumo num olhar
 
+Usa o **mesmo caminho de leitura do `gate`** (refaz a leitura ao vivo se a última estiver velha, via `--max-age`/`--refresh`) e a **mesma regra de veredito** — assim `status` e `gate` nunca discordam. Sem nenhuma leitura válida o veredito é `UNKNOWN` (nunca um `GO` falso), e um bucket ausente (ex.: rollout do Codex sem janela semanal) não derruba o comando.
+
 ```bash
 ~/.claude/tools/token_monitor.py status                       # gate 5h<80% · semanal<90% (defaults)
 ~/.claude/tools/token_monitor.py status --max-5h 70 --max-week 85
+~/.claude/tools/token_monitor.py status --refresh --no-notify # força leitura ao vivo, sem notificar
 ```
 
 ```text
 === Status — Claude + Codex (gate 5h<80% · semanal<90%) ===
 
-📊 Claude   5h: 95% · reset Jun 24 at 4:39pm   |   semanal: 80% · reset Jun 30 at 9am  🛑
-📊 Codex    5h: 42% · reset Jun 24 at 6:10pm   |   semanal: 18% · reset Jun 30 at 9am   [pro, 312s]
+📊 Claude   5h: 95% · reset Jun 24 at 4:39pm   |   semanal: 80% · reset Jun 30 at 9am  🛑   [cache 199s]
+📊 Codex    5h: 42% · reset Jun 24 at 6:10pm   |   semanal: 18% · reset Jun 30 at 9am        [rollout 312s]
 
 🛑 gate(both): PAUSE — estourado: claude
 ```
+
+Cada linha traz a origem da leitura entre colchetes (`ao vivo` / `cache Ns` no Claude, `rollout Ns` no Codex). Flags: `--max-5h`, `--max-week`, `--max-age`, `--refresh`, `--no-notify` (mesmos defaults do `gate`).
 
 #### Tabela `codex_meter` e env
 
