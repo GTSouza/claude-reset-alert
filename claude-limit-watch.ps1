@@ -90,7 +90,10 @@ $TgChatId = Env 'TG_CHAT_ID' (Env 'TELEGRAM_CHAT_ID' '')
 function Write-Log($msg) {
   $line = "{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg
   Write-Host $line
-  Add-Content -Path $LogFile -Value $line
+  # -Encoding utf8: o watch.log tem emoji/·; sem isto o Windows PowerShell 5.1 grava em
+  # UTF-16/ANSI e o ingest do token_monitor (que lê UTF-8) não casa o regex e perde as
+  # leituras. O BOM que o PS 5.1 põe é tolerado no lado Python (_WATCHLOG_RE).
+  Add-Content -Path $LogFile -Value $line -Encoding utf8
 }
 
 function Play-Sound($name) {
@@ -165,7 +168,9 @@ function Get-Usage {
 
 # Extrai @{ Pct; Reset } de uma linha do /usage que contenha $prefix.
 function Parse-Line($usage, $prefix) {
-  $line = ($usage -split "`n") | Where-Object { $_ -match [regex]::Escape($prefix) } | Select-Object -First 1
+  # -notmatch '(?i)only': ignora as linhas por-modelo "(... only)" p/ o prefixo genérico
+  # "Current week" casar a linha agregada mesmo se o /usage relabelar o "(all ...)".
+  $line = ($usage -split "`n") | Where-Object { $_ -match [regex]::Escape($prefix) -and $_ -notmatch '(?i)only' } | Select-Object -First 1
   $pct = $null; $reset = ''
   if ($line) {
     if ($line -match '(\d+)%\s*used') { $pct = [int]$Matches[1] }
@@ -176,7 +181,7 @@ function Parse-Line($usage, $prefix) {
 
 function Print-Status($usage) {
   $s = Parse-Line $usage 'Current session'
-  $w = Parse-Line $usage 'Current week (all'
+  $w = Parse-Line $usage 'Current week'
   Write-Log ("📊 5h: {0}% usado · reset {1}  |  semanal: {2}% usado · reset {3}" -f $s.Pct, $s.Reset, $w.Pct, $w.Reset)
 }
 
@@ -251,7 +256,7 @@ function Check-Once {
   Print-Status $usage
 
   $s = Parse-Line $usage 'Current session'
-  $w = Parse-Line $usage 'Current week (all'
+  $w = Parse-Line $usage 'Current week'
 
   Check-Window "limite de 5h" "session" $s.Pct $s.Reset $Sound5h
   Check-Window "limite SEMANAL" "week" $w.Pct $w.Reset $SoundWeek

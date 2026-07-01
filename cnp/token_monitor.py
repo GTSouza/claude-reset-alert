@@ -350,8 +350,10 @@ def ingest(con: sqlite3.Connection, verbose: bool = True) -> tuple[int, int]:
 # Linha do watch.log: "YYYY-MM-DD HH:MM:SS  📊 5h: N% usado · reset R1  |  semanal: M% usado · reset R2"
 # reset (.*?) e não (.+?): quando o /usage não traz o "resets ..." o watcher loga
 # "... reset  | ..." — os PERCENTUAIS ainda são válidos e não devem ser descartados.
+# \ufeff? tolera o BOM UTF-8 que o watcher do PowerShell (Add-Content -Encoding utf8)
+# põe no início do watch.log — senão a 1ª linha do arquivo nunca casaria o regex.
 _WATCHLOG_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+📊 5h:\s*(\d+)% usado · reset\s*(.*?)\s*\|\s+"
+    r"^\ufeff?(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+📊 5h:\s*(\d+)% usado · reset\s*(.*?)\s*\|\s+"
     r"semanal:\s*(\d+)% usado · reset\s*(.*?)\s*$"
 )
 WATCHLOG_PATH = Path(os.environ.get("WATCHLOG_PATH", str(Path.home() / ".claude" / "limit-watch" / "watch.log")))
@@ -598,6 +600,20 @@ def fmt(n: int) -> str:
     return f"{n:,}".replace(",", ".")
 
 
+def _trunc(s: str, width: int) -> str:
+    """Encurta preservando início E fim ('abc…xyz') com '…' no meio quando estoura a
+    largura — assim dois session_ids/projetos que só diferem no fim não viram a MESMA
+    linha na tabela (o corte simples '[:34]' fundia rótulos visualmente idênticos)."""
+    if len(s) <= width:
+        return s
+    if width <= 1:
+        return s[:width]
+    keep = width - 1
+    head = (keep + 1) // 2
+    tail = keep - head
+    return s[:head] + "…" + (s[-tail:] if tail else "")
+
+
 def report(con: sqlite3.Connection, args) -> None:
     now = datetime.now(timezone.utc)
     if args.since:
@@ -687,7 +703,7 @@ def report(con: sqlite3.Connection, args) -> None:
         print("-" * len(header))
         tot = {"in": 0, "out": 0, "msgs": 0}
         for g_disp, d in ordered:
-            print(f"{g_disp[:34]:<34} {fmt(d['in']):>12} {fmt(d['out']):>12} {d['out'] / tot_out * 100:>6.1f}% {d['msgs']:>6}")
+            print(f"{_trunc(g_disp, 34):<34} {fmt(d['in']):>12} {fmt(d['out']):>12} {d['out'] / tot_out * 100:>6.1f}% {d['msgs']:>6}")
             for k in tot:
                 tot[k] += d[k]
         print("-" * len(header))
@@ -704,7 +720,7 @@ def report(con: sqlite3.Connection, args) -> None:
     print("-" * len(header))
     tot = {"in": 0, "out": 0, "cread": 0, "cwrite": 0, "msgs": 0, "usd": 0.0}
     for g_disp, d in ordered:
-        print(f"{g_disp[:34]:<34} {fmt(d['in']):>12} {fmt(d['out']):>12} {fmt(d['cread']):>13} {fmt(d['cwrite']):>12} {d['msgs']:>6} {d['usd']:>9.2f}")
+        print(f"{_trunc(g_disp, 34):<34} {fmt(d['in']):>12} {fmt(d['out']):>12} {fmt(d['cread']):>13} {fmt(d['cwrite']):>12} {d['msgs']:>6} {d['usd']:>9.2f}")
         for k in tot:
             tot[k] += d[k]
     print("-" * len(header))
@@ -850,7 +866,11 @@ def _fetch_usage() -> str | None:
 
 
 def _parse_line(usage: str, prefix: str) -> tuple[int | None, str | None]:
-    line = next((ln for ln in usage.splitlines() if prefix.lower() in ln.lower()), None)
+    # ignora as linhas por-modelo "(... only)": assim o prefixo genérico "Current week"
+    # casa a linha agregada mesmo se o /usage relabelar (ex.: "(all Claude models)" ->
+    # "(combined)"), sem cair numa "(Sonnet only)".
+    line = next((ln for ln in usage.splitlines()
+                 if prefix.lower() in ln.lower() and "only" not in ln.lower()), None)
     if not line:
         return None, None
     mp = re.search(r"(\d+)%\s*used", line, re.IGNORECASE)
@@ -895,7 +915,7 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
         print("⚠️  /usage não retornou os percentuais (vazio/genérico).")
         return False
     s_pct, s_reset = _parse_line(usage, "Current session")
-    w_pct, w_reset = _parse_line(usage, "Current week (all")
+    w_pct, w_reset = _parse_line(usage, "Current week")
     now = datetime.now(timezone.utc)
     print(f"📊 5h: {s_pct}% usado · reset {s_reset}  |  semanal: {w_pct}% usado · reset {w_reset}")
 

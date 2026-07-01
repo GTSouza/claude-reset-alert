@@ -155,7 +155,9 @@ reset_to_epoch() { # "Mon DD at H[:MM]am/pm (tz)"
 # Extrai "<percent>|<reset>" de uma linha do /usage que comece com $2.
 parse_line() { # texto, prefixo
   local line pct reset
-  line="$(printf '%s\n' "$1" | grep -i "$2" | head -1)"
+  # grep -vi 'only': ignora as linhas por-modelo "(... only)" p/ o prefixo genérico
+  # "Current week" casar a linha agregada mesmo se o /usage relabelar o "(all ...)".
+  line="$(printf '%s\n' "$1" | grep -i "$2" | grep -vi 'only' | head -1)"
   [[ -z "$line" ]] && { echo "|"; return; }
   pct="$(printf '%s' "$line" | grep -oiE '[0-9]+% used' | grep -oE '[0-9]+' | head -1)"
   reset="$(printf '%s' "$line" | sed -n 's/.*resets \(.*\)/\1/p')"
@@ -165,7 +167,7 @@ parse_line() { # texto, prefixo
 print_status() {
   local usage="$1" s w
   s="$(parse_line "$usage" "Current session")"
-  w="$(parse_line "$usage" "Current week (all")"
+  w="$(parse_line "$usage" "Current week")"
   log "📊 5h: ${s%%|*}% usado · reset ${s#*|}  |  semanal: ${w%%|*}% usado · reset ${w#*|}"
 }
 
@@ -212,7 +214,7 @@ check_once() {
   print_status "$usage"
 
   s="$(parse_line "$usage" "Current session")"; s_pct="${s%%|*}"; s_reset="${s#*|}"
-  w="$(parse_line "$usage" "Current week (all")"; w_pct="${w%%|*}"; w_reset="${w#*|}"
+  w="$(parse_line "$usage" "Current week")"; w_pct="${w%%|*}"; w_reset="${w#*|}"
 
   check_window "limite de 5h" "session" "$s_pct" "$s_reset" "$SOUND_5H"
   check_window "limite SEMANAL" "week" "$w_pct" "$w_reset" "$SOUND_WEEK"
