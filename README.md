@@ -283,6 +283,8 @@ Por convenção fica em `~/.claude/tools/token_monitor.py` (a cópia versionada 
 
 > **Billing assinatura × crédito:** o monitor marca como `credits` o uso real produzido **depois** do medidor 5h ser confirmado em 100%, e como `subscription` o resto. Os relatórios `--by billing` e os custos `~USD` (calibrados via `calibrate`) saem desse cruzamento.
 
+> **Fuso nos relatórios:** o eixo `--by day` e o `--since YYYY-MM-DD` (em `report` e `codex-report`) usam o **fuso local** (`METER_TZ`), não UTC — a atividade da madrugada local fica no dia certo. Um `--since` com datetime ISO completo (com tz) é respeitado como dado.
+
 ### Gate de rate limit (para runners)
 
 O `gate` é o ponto de decisão único "**posso seguir trabalhando?**". Lê a última leitura do medidor do banco (custo zero) e só refaz uma leitura ao vivo se a anterior estiver velha (`--max-age`, padrão 300s). Aplica os tetos de 5h e semanal **juntos** e já entrega tudo mastigado:

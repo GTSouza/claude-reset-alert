@@ -535,6 +535,30 @@ WINDOWS = {
 }
 
 
+def _meter_tz():
+    return ZoneInfo(METER_TZ) if ZoneInfo else timezone.utc
+
+
+def _tz_offset_seconds() -> int:
+    """Offset ATUAL do METER_TZ vs UTC, em segundos (ex.: America/Sao_Paulo -> -10800).
+    Rotula o eixo 'day' no fuso local. Exato p/ zonas sem DST (Sao_Paulo); numa zona com
+    DST usa o offset de agora p/ toda a janela (pode errar 1h nas viradas — aceitável)."""
+    try:
+        return int(datetime.now(_meter_tz()).utcoffset().total_seconds())
+    except Exception:
+        return 0
+
+
+def _since_epoch_local(s: str) -> float:
+    """'YYYY-MM-DD' (ou ISO) -> epoch. Data sem hora vira meia-noite no METER_TZ (local),
+    consistente com o resto do relatório (que renderiza em local); um datetime ISO já com
+    tz é respeitado. Antes '--since' assumia UTC e deslocava a janela pelo offset local."""
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_meter_tz())
+    return dt.timestamp()
+
+
 def base_cost(model: str | None, r: dict) -> float:
     """Custo NOMINAL (sem o fator de calibração)."""
     key = _norm_model(model)
@@ -575,21 +599,27 @@ def fmt(n: int) -> str:
 def report(con: sqlite3.Connection, args) -> None:
     now = datetime.now(timezone.utc)
     if args.since:
-        since_epoch = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc).timestamp()
+        since_epoch = _since_epoch_local(args.since)
         label = f"desde {args.since}"
     else:
         delta = WINDOWS.get(args.window, WINDOWS["week"])
         since_epoch = (now - delta).timestamp()
         label = f"últimos {args.window}"
 
-    group = {
-        "model": "model",
-        "session": "session_id",
-        "project": "project",
-        "day": "substr(ts,1,10)",
-        "billing": "billing_source",
-        "none": "'GLOBAL'",
-    }.get(args.by, "'GLOBAL'")
+    # O eixo 'day' agrupa/rotula no fuso local (METER_TZ), não em UTC — senão a atividade
+    # da madrugada local cai no dia seguinte. O offset entra como parâmetro do SELECT.
+    group_params: list = []
+    if args.by == "day":
+        group = "substr(datetime(ts_epoch + ?, 'unixepoch'), 1, 10)"
+        group_params = [_tz_offset_seconds()]
+    else:
+        group = {
+            "model": "model",
+            "session": "session_id",
+            "project": "project",
+            "billing": "billing_source",
+            "none": "'GLOBAL'",
+        }.get(args.by, "'GLOBAL'")
 
     # Filtros opcionais (--model exato, --session prefixo, --project substring).
     # As mesmas colunas existem em `usage` e `limits`, então o WHERE serve aos dois.
@@ -617,7 +647,7 @@ def report(con: sqlite3.Connection, args) -> None:
         FROM usage WHERE {where_sql}
         GROUP BY g, model
     """
-    subrows = con.execute(sql, params).fetchall()
+    subrows = con.execute(sql, group_params + params).fetchall()
 
     print(f"\n=== Uso de tokens — {label} — por {args.by} ===\n")
     if not subrows:
@@ -869,7 +899,9 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
             ("5h", "5h", "Ping", s_pct, p_spct, s_re, p_sre, s_reset),
             ("week", "SEMANAL", "Submarine", w_pct, p_wpct, w_re, p_wre, w_reset),
         ):
-            if rep and p_rep and rep - p_rep > RESET_TOLERANCE:
+            # exige pct conhecido: um avanço de epoch com pct=None (parse falhou) não deve
+            # virar '🟢 resetou — 0% usado' e enganar um runner a retomar cedo demais.
+            if pct is not None and rep and p_rep and rep - p_rep > RESET_TOLERANCE:
                 events.append(f"reset_{key}")
                 _notify(*_meter_alert("Claude Code", None, "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
             elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
@@ -926,7 +958,7 @@ def meter_report(con: sqlite3.Connection, args) -> None:
     print(f"{'quando (UTC)':<22}{'5h':>5}{'  reset 5h':<26}{'sem':>5}{'  reset semanal':<24}{'  evento'}")
     print("-" * 100)
     for ts, sp, sr, wp, wr, ev in rows:
-        print(f"{ts[:19]:<22}{(str(sp)+'%'):>5}  {(sr or '?')[:22]:<24}{(str(wp)+'%'):>5}  {(wr or '?')[:20]:<22}{'  '+ev if ev else ''}")
+        print(f"{ts[:19]:<22}{_pctstr(sp):>5}  {(sr or '?')[:22]:<24}{_pctstr(wp):>5}  {(wr or '?')[:20]:<22}{'  '+ev if ev else ''}")
     print()
 
 
@@ -975,10 +1007,15 @@ def _pctstr(x) -> str:
     return f"{round(x)}%" if x is not None else "?"
 
 
-def read_codex_meter(scan_files: int = 8):
+def read_codex_meter(scan_files: int = 40):
     """Rate-limit mais recente do Codex a partir dos rollouts. Retorna dict
     {ts_epoch, session_pct, session_reset_epoch, week_pct, week_reset_epoch, plan}
-    ou None. session=primary(5h, 300min); week=secondary(semanal, 10080min)."""
+    ou None. session=primary(5h, 300min); week=secondary(semanal, 10080min).
+
+    Varre do rollout mais novo p/ o mais velho e PARA no primeiro arquivo com rate_limits
+    (mtime mais novo = leitura mais fresca). scan_files é só o teto de segurança quando
+    NENHUM rollout recente tem rate_limits — antes o corte fixo em 8 podia perder a leitura
+    (usuário com muitas sessões novas sem token_count) e devolver None indevidamente."""
     if not CODEX_SESSIONS_DIR.exists():
         return None
     files = sorted(CODEX_SESSIONS_DIR.glob("*/*/*/rollout-*.jsonl"),
@@ -1015,6 +1052,10 @@ def read_codex_meter(scan_files: int = 8):
                 }
         except Exception:
             continue
+        # newest-first: o 1º arquivo que rende uma leitura já é o mais fresco; não precisa
+        # varrer os mais antigos (evita ler dezenas de rollouts a cada poll do gate/status).
+        if best is not None:
+            break
     return best
 
 
@@ -1268,10 +1309,15 @@ def _codex_reading(args) -> dict:
     # ficaria preso no % antigo para sempre e um runner gated em codex nunca acordaria.
     s_pct, w_pct = m["session_pct"], m["week_pct"]
     s_re, w_re = m.get("session_reset_epoch"), m.get("week_reset_epoch")
+    ts = m.get("ts_epoch")
     note = ""
-    if s_re and now >= s_re:
+    # Só zera se o reset é POSTERIOR ao snapshot e já passou (janela realmente recuperada).
+    # Um resets_at já vencido NO MOMENTO do rollout é ruído do CLI, não um reset novo — zerar
+    # aí faria o gate liberar (GO) com uma leitura de, digamos, 95% ainda válida. Mesmo guard
+    # de _codex_refresh_needed (now >= re > ts).
+    if s_re and ts and s_re > ts and now >= s_re:
         s_pct = 0.0; note += " · 5h resetou"
-    if w_re and now >= w_re:
+    if w_re and ts and w_re > ts and now >= w_re:
         w_pct = 0.0; note += " · semanal resetou"
     age = max(0, int(now - m["ts_epoch"])) if m.get("ts_epoch") else 0
     return {"label": "codex", "session_pct": s_pct, "session_reset": _fmt_epoch(s_re),
@@ -1648,18 +1694,22 @@ def codex_report(con: sqlite3.Connection, args) -> None:
     assinatura: reporta tokens e tempo ativo, não custo por token."""
     now = datetime.now(timezone.utc)
     if getattr(args, "since", ""):
-        since_epoch = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc).timestamp()
+        since_epoch = _since_epoch_local(args.since)
         label = f"desde {args.since}"
     else:
         delta = WINDOWS.get(args.window, WINDOWS["week"])
         since_epoch = (now - delta).timestamp()
         label = f"últimos {args.window}"
-    group = {
-        "session": "session_id",
-        "model": "model",
-        "day": "substr(datetime(started_epoch, 'unixepoch'), 1, 10)",
-        "none": "'GLOBAL'",
-    }.get(args.by, "session_id")
+    group_params: list = []
+    if args.by == "day":
+        group = "substr(datetime(started_epoch + ?, 'unixepoch'), 1, 10)"  # dia no fuso local
+        group_params = [_tz_offset_seconds()]
+    else:
+        group = {
+            "session": "session_id",
+            "model": "model",
+            "none": "'GLOBAL'",
+        }.get(args.by, "session_id")
     rows = con.execute(f"""
         SELECT {group} AS g,
                SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
@@ -1667,7 +1717,7 @@ def codex_report(con: sqlite3.Connection, args) -> None:
                SUM(MAX(ended_epoch - started_epoch, 0)), COUNT(*)
         FROM codex_usage WHERE started_epoch >= ?
         GROUP BY g ORDER BY SUM(total_tokens) DESC
-    """, (since_epoch,)).fetchall()
+    """, group_params + [since_epoch]).fetchall()
     print(f"\n=== Uso do Codex — {label} — por {args.by} ===\n")
     if not rows:
         print("(sem dados nesta janela; rode: token_monitor.py ingest)\n")
