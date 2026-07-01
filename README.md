@@ -39,10 +39,9 @@ Para cada janela (5h e semanal), dispara uma notificação quando:
 1. **O horário de reset avança** além de `RESET_TOLERANCE` → começou uma nova janela; ou
 2. **O % de uso cai** além de `DROP_THRESHOLD` → a cota liberou ou a janela resetou.
 
-Quando o evento é um **drop** (% caiu sem o epoch avançar):
-- Se o novo % é **0%** → mensagem de "resetou" (🟢), idêntica ao reset por epoch.
-- Se o novo % ainda é **> 0%** → mensagem de "liberou" (🔵), indicando queda parcial.
-- Se o drop ocorreu **fora de ±30 min do reset esperado** (reset antecipado ou queda inesperada) → ⚠️ adicionado ao título.
+No **shell** a notificação é simples: avanço de horário → **"resetou ✅"**; queda de % → **"liberou ⬇️"** com "Uso caiu de X% para Y%" (sem distinguir 0% vs parcial nem marcar ⚠️).
+
+> O subcomando [`meter`](#monitor-de-tokens-cnptoken_monitorpy) do `token_monitor.py` usa um esquema **mais rico** para os mesmos eventos: 🟢 resetou (0%) · 🔵 liberou (>0%) · 🔴 cap 100% · 💳 crédito, e marca **⚠️** quando o drop cai fora de ±30 min do reset previsto. Se você quer esses estados, rode o `meter --watch` em vez (ou além) do watcher shell.
 
 > O texto do `/usage` arredonda os minutos a cada consulta (ex.: `3pm` ↔ `2:59pm`), então a detecção compara o **instante** do reset com tolerância (`RESET_TOLERANCE`, padrão 600s) em vez do texto literal — assim variações de poucos minutos não geram falsos alertas de reset.
 
