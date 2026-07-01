@@ -108,7 +108,7 @@ def send_token_report(
     window: str = Field(default="week", description="Time window: 5h, day, week, month (report only, ignored if since is set)"),
     since: str = Field(default="", description="Start date ISO YYYY-MM-DD, overrides window (report only)"),
     by: str = Field(default="none", description="Group by: model, session, project, day, billing, none (report only)"),
-    model_filter: str = Field(default="", description="Filter by exact model name, e.g. claude-fable-5 (report only)"),
+    model_filter: str = Field(default="", description="Filter by base model id, prefix match e.g. claude-fable-5 / claude-sonnet-5 / claude-haiku-4-5 (matches [1m]/dated variants; report only)"),
     session_filter: str = Field(default="", description="Filter by session_id prefix (report only)"),
     project_filter: str = Field(default="", description="Filter by project substring (report only)"),
     io_only: bool = Field(default=False, description="Show only input/output tokens, no cache/cost (report only)"),

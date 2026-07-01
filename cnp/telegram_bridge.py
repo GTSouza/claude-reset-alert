@@ -42,7 +42,7 @@ send_token_report parameter mapping:
   window    → "5h", "day", "week" (default), "month"
   since     → ISO date "YYYY-MM-DD" (overrides window)
   by        → "none" (default/global), "model", "session", "project", "day", "billing"
-  model_filter   → exact model name, e.g. "claude-fable-5", "claude-sonnet-4-6", "claude-haiku-4-5"
+  model_filter   → base model id (prefix match), e.g. "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5" (matches [1m]/dated variants)
   session_filter → session_id prefix
   project_filter → project name substring
   io_only   → true = show only in/out tokens (no cache/cost), comparable to Claude app
@@ -52,7 +52,7 @@ Natural language → parameter examples:
   "relatório da semana por modelo"          → command=report, window=week, by=model
   "uso de hoje"                             → command=report, window=day
   "tokens do fable" / "modelo fable"        → command=report, model_filter=claude-fable-5, by=model
-  "tokens do sonnet"                        → command=report, model_filter=claude-sonnet-4-6, by=model
+  "tokens do sonnet"                        → command=report, model_filter=claude-sonnet-5, by=model
   "últimas 5h por sessão"                   → command=report, window=5h, by=session
   "desde junho por projeto"                 → command=report, since=2026-06-01, by=project
   "assinatura vs crédito"                   → command=report, by=billing

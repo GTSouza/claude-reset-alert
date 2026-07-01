@@ -623,8 +623,9 @@ def report(con: sqlite3.Connection, args) -> None:
             "none": "'GLOBAL'",
         }.get(args.by, "'GLOBAL'")
 
-    # Filtros opcionais (--model exato, --session prefixo, --project substring).
-    # As mesmas colunas existem em `usage` e `limits`, então o WHERE serve aos dois.
+    # Filtros opcionais (--model prefixo do id, --session prefixo, --project substring).
+    # --model casa por PREFIXO: o Claude Code grava variantes '[1m]' e datadas ('-YYYYMMDD'),
+    # então '--model claude-haiku-4-5' precisa pegar 'claude-haiku-4-5-20251001' (senão dá 0).
     where = ["ts_epoch >= ?"]
     params: list = [since_epoch]
     # Batidas de limite são da CONTA (o banner de cap não carrega o modelo filtrado de
@@ -632,7 +633,7 @@ def report(con: sqlite3.Connection, args) -> None:
     lim_where = ["ts_epoch >= ?"]
     lim_params: list = [since_epoch]
     for name, val, clause, param in (
-        ("model", args.model, "model = ?", args.model),
+        ("model", args.model, "model LIKE ?", f"{args.model}%"),
         ("session", args.session, "session_id LIKE ?", f"{args.session}%"),
         ("project", args.project, "project LIKE ?", f"%{args.project}%"),
     ):
@@ -1814,7 +1815,7 @@ def main() -> None:
     rp.add_argument("--window", choices=list(WINDOWS), default="week")
     rp.add_argument("--since", help="data ISO (YYYY-MM-DD); sobrepõe --window")
     rp.add_argument("--by", choices=["model", "session", "project", "day", "billing", "none"], default="none")
-    rp.add_argument("--model", help="filtra por model exato (ex.: claude-fable-5)")
+    rp.add_argument("--model", help="filtra por PREFIXO do model (ex.: claude-haiku-4-5 casa -20251001/[1m]; claude-fable-5)")
     rp.add_argument("--session", help="filtra por prefixo de session_id (ex.: 86e5a22d)")
     rp.add_argument("--project", help="filtra por substring do projeto (ex.: GATSO ou wf_)")
     rp.add_argument("--io-only", dest="io_only", action="store_true",
