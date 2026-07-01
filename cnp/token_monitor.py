@@ -291,9 +291,13 @@ def parse_ts(ts: str) -> float:
 
 # --------------------------- Ingest ---------------------------------------- #
 def ingest(con: sqlite3.Connection, verbose: bool = True) -> tuple[int, int]:
-    new_usage = new_limits = 0
+    new_usage = new_limits = bad_ts = 0
     for jf in PROJECTS_DIR.rglob("*.jsonl"):
         project = jf.parent.name
+        try:
+            file_mtime = jf.stat().st_mtime
+        except OSError:
+            file_mtime = 0.0
         for line in _iter_new_lines(con, jf):
             try:
                 o = json.loads(line)
@@ -307,6 +311,13 @@ def ingest(con: sqlite3.Connection, verbose: bool = True) -> tuple[int, int]:
                 continue
             ts = o.get("timestamp", "")
             ts_epoch = parse_ts(ts)
+            # timestamp ausente/ilegível => parse_ts devolve 0.0, e um ts_epoch=0 fica
+            # INVISÍVEL em todo relatório com janela (ts_epoch >= since) e no billing.
+            # Cai no mtime do arquivo (aproximação razoável) para a linha não sumir; conta
+            # p/ avisar. A PK (uuid) mantém a releitura idempotente.
+            if ts_epoch == 0.0 and file_mtime:
+                ts_epoch = file_mtime
+                bad_ts += 1
             model = msg.get("model")
             session_id = o.get("sessionId")
 
@@ -347,6 +358,7 @@ def ingest(con: sqlite3.Connection, verbose: bool = True) -> tuple[int, int]:
     if verbose:
         extra = f" | +{n_log} leituras do watch.log" if n_log else ""
         extra += f" | +{n_codex} sessões Codex" if n_codex else ""
+        extra += f" | ⚠️ {bad_ts} sem timestamp (usei o mtime do arquivo)" if bad_ts else ""
         print(f"ingest: +{new_usage} mensagens de uso, +{new_limits} batidas de limite "
               f"| {n_credits} msgs ≈créditos{extra}")
     return new_usage, new_limits
