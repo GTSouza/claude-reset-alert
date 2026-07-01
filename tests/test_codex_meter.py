@@ -57,11 +57,15 @@ class CodexMeterAlertsTest(unittest.TestCase):
         self.assertEqual(notify.call_count, 1)
         self.assertIn("resetou", notify.call_args.args[0])
 
-    def test_reset_epoch_without_percentage_change_does_not_notify(self):
+    def test_reset_fires_on_epoch_advance_even_when_saturated(self):
+        """Janela re-saturada: o resets_at avançou (1100 -> 3000) mas o % continua igual
+        (98 -> 98) — o reset cruzou e a cota voltou ao mesmo nível na mesma. Como o
+        resets_at é um instante absoluto estável na janela, o avanço já é reset: deve
+        alertar UMA vez e NÃO repetir ao reler o mesmo snapshot (idempotência por ts_epoch)."""
         snapshot = {
             "ts_epoch": 2000,
-            "session_pct": 98,
-            "session_reset_epoch": 3000,
+            "session_pct": 98,            # igual ao prev (98): o % não mudou
+            "session_reset_epoch": 3000,  # avançou de 1100, > RESET_TOLERANCE
             "week_pct": 50,
             "week_reset_epoch": 9000,
             "plan": "plus",
@@ -71,12 +75,14 @@ class CodexMeterAlertsTest(unittest.TestCase):
              patch.object(token_monitor, "_notify") as notify:
             with contextlib.redirect_stdout(io.StringIO()):
                 token_monitor.codex_meter_once(self.con, notify=False)
+                event = self.con.execute(              # marcado no momento da detecção
+                    "SELECT event FROM codex_meter WHERE ts_epoch = 2000"
+                ).fetchone()[0]
+                token_monitor.codex_meter_once(self.con, notify=False)  # re-lê o mesmo snapshot
 
-        notify.assert_not_called()
-        event = self.con.execute(
-            "SELECT event FROM codex_meter WHERE ts_epoch = 2000"
-        ).fetchone()[0]
-        self.assertIsNone(event)
+        self.assertEqual(notify.call_count, 1)          # disparou 1x, não repetiu
+        self.assertIn("resetou", notify.call_args.args[0])
+        self.assertIn("reset_5h", event)
 
 
 class CodexWatchTickRefreshTest(unittest.TestCase):

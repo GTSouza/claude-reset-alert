@@ -1202,10 +1202,12 @@ def codex_meter_once(con: sqlite3.Connection, notify: bool = True, as_json: bool
             ("5h", "5h", "Ping", s_pct, p_spct, s_re, p_sre, s_reset),
             ("week", "SEMANAL", "Submarine", w_pct, p_wpct, w_re, p_wre, w_reset),
         ):
-            # Um reset só é notificável quando o novo snapshot também trouxe uma
-            # porcentagem diferente. Avanço isolado de resets_at não é mudança de uso.
-            pct_changed = pct is not None and p_pct is not None and pct != p_pct
-            if pct_changed and rep and p_rep and rep - p_rep > RESET_TOLERANCE:
+            # O resets_at do Codex é um INSTANTE ABSOLUTO estável dentro da janela (medido
+            # nos rollouts reais: fica fixo enquanto o % sobe e só avança num reset de fato).
+            # Logo o avanço > tolerância JÁ é reset — mesmo com o % igual (janela semanal
+            # re-saturada 100%->100% no reset). A idempotência (não repetir o MESMO reset em
+            # rollouts seguintes) vem do prev por `ts_epoch <= ?`, não de exigir mudança de %.
+            if pct is not None and rep and p_rep and rep - p_rep > RESET_TOLERANCE:
                 events.append(f"reset_{key}")
                 _notify(*_meter_alert("Codex", m.get("plan"), "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
             elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
