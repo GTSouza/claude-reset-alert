@@ -43,7 +43,7 @@ No **shell** a notificação é simples: avanço de horário → **"resetou ✅"
 
 > O subcomando [`meter`](#monitor-de-tokens-cnptoken_monitorpy) do `token_monitor.py` usa um esquema **mais rico** para os mesmos eventos: 🟢 resetou (natural) · 🟠 reset **ANTECIPADO** · 🔵 liberou (>0%) · 🔴 cap 100% · 💳 crédito. Se você quer esses estados, rode o `meter --watch` em vez (ou além) do watcher shell.
 >
-> **Dois tipos de reset.** O reset **natural** cai no horário programado (ou depois). O reset **antecipado** (🟠) é quando a Anthropic zera a cota **antes** da janela prevista (`now < reset previsto − RESET_TOLERANCE`); a mensagem diz "era p/ &lt;horário&gt;". No momento do reset o `/usage` às vezes volta como `N% used` **sem** a linha `resets ...` (horário = None) por vários minutos — então, na transição, o `meter` faz uma releitura ao vivo de confirmação (haiku, quase custo zero; no máximo uma por `RECONFIRM_COOLDOWN`, padrão 10min, mesmo se o `/usage` oscilar; `METER_RECONFIRM=0` desliga) para recuperar o horário novo e separar um reset real de um glitch transitório (se a releitura traz de volta o valor antigo não-zero, foi glitch e é adotado). Se o horário novo ainda não veio, ele é **estimado** uma vez (`now` + duração da janela: 5h / 7d) e marcado com `≈`, carregado adiante enquanto a janela seguir zerada até um poll saudável trazer o real (`METER_INFER_RESET=0` desliga a estimativa e deixa o horário desconhecido).
+> **Dois tipos de reset.** O reset **natural** cai no horário programado (ou depois). O reset **antecipado** (🟠) é quando a Anthropic zera a cota **antes** da janela prevista (`now < reset previsto − RESET_TOLERANCE`); a mensagem diz "era p/ &lt;horário&gt;". No momento do reset o `/usage` às vezes volta como `N% used` **sem** a linha `resets ...` (horário = None) por vários minutos — então, na transição, o `meter` faz uma releitura ao vivo de confirmação (haiku, quase custo zero; no máximo uma por `RECONFIRM_COOLDOWN`, padrão 10min, mesmo se o `/usage` oscilar; `METER_RECONFIRM=0` desliga) para recuperar o horário novo e separar um reset real de um glitch transitório (se a releitura traz de volta o valor antigo não-zero, foi glitch e é adotado). Se a releitura ainda vier sem horário, entra o **warm-up** (`METER_WARMUP=1`, padrão): um prompt mínimo no modelo mais barato **gasta um tiquinho da cota recém-resetada** para tirar a janela de 0% — o `/usage` parece omitir a linha `resets` com a janela ociosa em 0% — e relê uma vez buscando o horário REAL (`METER_WARMUP=0` desliga; este passo **não** é custo zero). Se o horário ainda não veio, ele é **estimado** uma vez (`now` + duração da janela: 5h / 7d) e marcado com `≈`, carregado adiante enquanto a janela seguir zerada até um poll saudável trazer o real (`METER_INFER_RESET=0` desliga a estimativa e deixa o horário desconhecido).
 
 > O texto do `/usage` arredonda os minutos a cada consulta (ex.: `3pm` ↔ `2:59pm`), então a detecção compara o **instante** do reset com tolerância (`RESET_TOLERANCE`, padrão 600s) em vez do texto literal — assim variações de poucos minutos não geram falsos alertas de reset.
 
@@ -151,12 +151,12 @@ DROP_THRESHOLD=10 ./claude-limit-watch.sh once # só alerta se o uso cair >10%
 
 ### Onde colocar as credenciais
 
-O script carrega as variáveis automaticamente, nesta ordem (a primeira que existir já vale):
+O script carrega os DOIS arquivos em sequência — quando ambos existem e definem a mesma chave, **o `.env` da pasta do script (carregado por último) tem a palavra final**:
 
 1. `~/.claude/limit-watch/telegram.env`
-2. `.env` na pasta do script
+2. `.env` na pasta do script *(sobrescreve o anterior em chaves repetidas)*
 
-Para o Telegram, aceita tanto `TG_TOKEN`/`TG_CHAT_ID` quanto `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`.
+Não duplique chaves nos dois arquivos: quem rotaciona o token só no `telegram.env` mas mantém um `.env` antigo na pasta do repo segue usando o token velho (e o envio falha em silêncio, só logado no `watch.log`). Para o Telegram, aceita tanto `TG_TOKEN`/`TG_CHAT_ID` quanto `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`.
 
 ## Notificações no Telegram (opcional)
 
@@ -292,7 +292,9 @@ Use o caminho absoluto do wrapper no `command`. O `SessionStart` mantém o banco
 |---|---|
 | `ingest` | Varre os `.jsonl` + `watch.log` e popula o banco (idempotente, incremental). Deduplica por `message.id`: cada mensagem da API aparece em várias linhas do transcript (uma por bloco de conteúdo) com o mesmo `usage` — contar por linha inflaria tudo ~2-3x. |
 | `rebuild-usage` | Reconstrói a tabela `usage` com o dedup por `message.id` (migra um banco da era pré-dedup): faz backup, re-ingere as sessões com transcript em disco, deduplica órfãs por heurística e recalcula/re-aplica a calibração (`--no-calibrate` pula). |
+| `watch` | `ingest` contínuo em loop (`--interval`, padrão 60s) — mantém o banco fresco sem hooks/cron externos. |
 | `report` | Relatório agregado por janela (`--window 5h/day/week/month`) e eixo (`--by model/session/project/day/billing/none`). `--io-only` mostra só in/out (comparável ao app do Claude). |
+| `codex-report` | Uso de tokens do **Codex** por sessão/dia/modelo (tokens + tempo ativo; assinatura, sem custo/token) — ver seção própria abaixo. |
 | `limits` | Episódios em que você bateu o limite. |
 | `meter` | Uma leitura do `/usage` do Claude (custo zero) — **e o Codex junto, se houver rollouts** (`--no-codex` desliga); grava na tabela `meter` e alerta reset/queda/cap. `--watch --interval 300` roda em loop (e confirma o Codex ao vivo quando um reset cruza, veja abaixo). |
 | `meter-report` | Histórico das leituras do medidor. |
@@ -307,6 +309,24 @@ Use o caminho absoluto do wrapper no `command`. O `SessionStart` mantém o banco
 
 > **Fuso nos relatórios:** o eixo `--by day` e o `--since YYYY-MM-DD` (em `report` e `codex-report`) usam o **fuso local** (`METER_TZ`), não UTC — a atividade da madrugada local fica no dia certo. Um `--since` com datetime ISO completo (com tz) é respeitado como dado.
 
+### Variáveis de ambiente do monitor
+
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `METER_MODEL` | `haiku` | Modelo usado nas chamadas `/usage` do monitor (a var `MODEL` é só dos watchers shell). |
+| `METER_TZ` | `America/Sao_Paulo` | Fuso do medidor: âncora dos horários de reset sem fuso na linha e dos eixos `--by day`/`--since`. |
+| `RESET_TOLERANCE` | `600` | Segundos de variação no horário de reset que não contam como nova janela. |
+| `DROP_THRESHOLD` | `5` | Queda mínima de % para alertar "liberou". |
+| `FETCH_RETRIES` | `3` | Tentativas de ler o `/usage` por ciclo. |
+| `METER_RECONFIRM` | `1` | Releitura de confirmação numa leitura degradada (`0` desliga). |
+| `RECONFIRM_COOLDOWN` | `600` | Segundos mínimos entre releituras de confirmação (limita o custo se o `/usage` oscilar). |
+| `METER_WARMUP` | `1` | Warm-up (prompt mínimo, **gasta cota**) quando o reconfirm não recupera o horário (`0` desliga). |
+| `METER_INFER_RESET` | `1` | Estimativa `≈` do próximo reset quando o horário não veio (`0` deixa desconhecido). |
+| `CREDIT_PCT` | `100` | Limiar do medidor 5h a partir do qual a janela conta como capada (cap/crédito). |
+| `WATCHLOG_PATH` | `~/.claude/limit-watch/watch.log` | Watch.log importado pelo `ingest` (aponte para o `STATE_DIR` customizado do watcher, se houver). |
+| `FACTORS_PATH` | `~/.claude/tools/pricing_factors.json` | Onde `calibrate --apply` grava os fatores de custo por modelo. |
+| `CODEX_SESSIONS_DIR` | `~/.codex/sessions` | Diretório de rollouts do Codex. |
+
 ### Gate de rate limit (para runners)
 
 O `gate` é o ponto de decisão único "**posso seguir trabalhando?**". Lê a última leitura do medidor do banco (custo zero) e só refaz uma leitura ao vivo se a anterior estiver velha (`--max-age`, padrão 300s). Aplica os tetos de 5h e semanal **juntos** e já entrega tudo mastigado:
@@ -320,12 +340,12 @@ Saída em `PAUSE`:
 
 ```text
 📊 5h: 95% · reset Jun 11 at 4:39pm (America/Sao_Paulo)  |  semanal: 80% · reset ...  (cache 199s)
-motivo: 5h em 95% (>= 80%)
+motivo: claude 5h em 95% (>= 80%)
 DECISION: PAUSE
 🛑 Pare. Não inicie novas tarefas. Faça commit do que está validado e responda no formato de pausa abaixo...
 ─────── cole e complete ───────
 pausado: <N> tarefas restantes
-motivo: 5h em 95% (>= 80%)
+motivo: claude 5h em 95% (>= 80%)
 reset: Jun 11 at 4:39pm (America/Sao_Paulo)
 semanal: 80%
 ────────────────────────────────

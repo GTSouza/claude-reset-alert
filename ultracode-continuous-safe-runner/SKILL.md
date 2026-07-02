@@ -42,10 +42,12 @@ usuário pedir (ex.: `gate --max-5h 70`). Para automação, `gate --json` traz o
 campos prontos, incluindo `advice` e `pause_header`.
 
 Por padrão o gate mede só o provedor primário (`--provider claude`) — decisão, exit codes
-(`0`/`10`/`2`) e bloco de pausa idênticos. Se um lote usar dois modelos (um implementa, outro
-revisa), `--provider both` retorna `PAUSE` se qualquer um estourar e o `motivo:` prefixa o
-provedor responsável; `--provider codex` mede só o revisor. O contrato (`DECISION:`, exit,
-`pause_header`, chaves do `--json`) é o mesmo em qualquer modo.
+(`0`/`10`/`2`) e bloco de pausa idênticos. O `motivo:` vem SEMPRE prefixado pelo provedor
+(ex.: `motivo: claude 5h em 95% (>= 80%)`), em qualquer modo — automações que parseiam o
+bloco devem esperar o prefixo. Se um lote usar dois modelos (um implementa, outro revisa),
+`--provider both` retorna `PAUSE` se qualquer um estourar (o prefixo aponta o responsável);
+`--provider codex` mede só o revisor. O contrato (`DECISION:`, exit, `pause_header`,
+chaves do `--json`) é o mesmo em qualquer modo.
 
 Nunca use `budget` do Workflow como medidor de consumo: ele não representa o consumo real.
 

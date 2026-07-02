@@ -134,9 +134,9 @@ O `chat_id` padrão (definido em `TELEGRAM_CHAT_ID`) é usado automaticamente.
 
 A tool `send_token_report` executa o `~/.claude/tools/token_monitor.py` e envia o resultado formatado direto no Telegram.
 
-**Relatório da semana agrupado por modelo:**
+**Relatório da semana agrupado por modelo** (peça o agrupamento — sem `by` o relatório sai global, numa linha só):
 ```
-Manda o relatório de tokens da semana no Telegram
+Manda o relatório de tokens da semana por modelo no Telegram
 ```
 
 **Relatório das últimas 5h agrupado por sessão:**
@@ -159,6 +159,16 @@ Manda no Telegram os episódios de rate limit
 Envia o meter-report no Telegram
 ```
 
+**Histórico do medidor do Codex:**
+```
+Envia o medidor do codex no Telegram
+```
+
+**Status (gate GO/PAUSE num olhar):**
+```
+Manda o status no Telegram — posso rodar?
+```
+
 **Detalhamento de bursts de atividade:**
 ```
 Manda o relatório de bursts no Telegram
@@ -168,9 +178,15 @@ Manda o relatório de bursts no Telegram
 
 | Parâmetro | Opções | Padrão | Descrição |
 |---|---|---|---|
-| `command` | `report`, `limits`, `meter-report`, `bursts` | `report` | Subcomando do token_monitor |
-| `window` | `5h`, `day`, `week`, `month` | `week` | Janela de tempo (só para `report`) |
-| `by` | `model`, `session`, `project`, `day`, `billing`, `none` | `model` | Eixo de agrupamento (só para `report`) |
+| `command` | `report`, `limits`, `meter-report`, `codex-meter-report`, `status`, `bursts` | `report` | Subcomando do token_monitor |
+| `window` | `5h`, `day`, `week`, `month` | `week` | Janela de tempo (só `report`; ignorada se `since` vier) |
+| `since` | data ISO `YYYY-MM-DD` | — | Início da janela; sobrepõe `window` (só `report`) |
+| `by` | `model`, `session`, `project`, `day`, `billing`, `none` | `none` (global) | Eixo de agrupamento (só `report`) — peça "por modelo" etc. para agrupar |
+| `model_filter` | id base do modelo (prefixo) | — | Ex.: `claude-fable-5`, `claude-sonnet-5` — casa variantes `[1m]`/datadas (só `report`) |
+| `session_filter` | prefixo de session_id | — | Filtra por sessão (só `report`) |
+| `project_filter` | substring do projeto | — | Filtra por projeto (só `report`) |
+| `io_only` | `true`/`false` | `false` | Só in/out, sem cache/custo — comparável ao app (só `report`) |
+| `limit` | inteiro | `50` | Máx. de linhas (`limits`, `meter-report`, `codex-meter-report`) |
 | `chat_id` | qualquer chat ID | `TELEGRAM_CHAT_ID` | Destinatário (usa o padrão se omitido) |
 
 ## Ponte Telegram ↔ Claude Code (`telegram_bridge.py`)
