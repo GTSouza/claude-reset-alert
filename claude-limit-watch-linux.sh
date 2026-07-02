@@ -258,6 +258,27 @@ case "${1:-watch}" in
   once)  check_once; exit $? ;;
   getid) show_chat_ids; exit $? ;;
   watch)
+    # Instância única: dois medidores rodando juntos (este script duplicado, ou
+    # este + token_monitor.py em modo watch) duplicam as leituras que acabam na
+    # tabela meter (via watch.log/ingest) e as notificações.
+    # ('.*--watch' e não ' --watch': a ordem das flags não é fixa)
+    if pgrep -f 'token_monitor\.py (meter|codex-meter) .*--watch|token_monitor\.py watch' >/dev/null 2>&1; then
+      echo "já existe um token_monitor.py em modo watch medindo o /usage — dois watchers duplicariam os dados. Saindo." >&2
+      exit 1
+    fi
+    # pidfile com criação ATÔMICA (noclobber): duas instâncias simultâneas não
+    # passam as duas — só quem criou o arquivo segue; a outra valida o dono.
+    PID_FILE="$STATE_DIR/claude-limit-watch.pid"
+    while ! ( set -o noclobber; printf '%s' "$$" > "$PID_FILE" ) 2>/dev/null; do
+      _old="$(cat "$PID_FILE" 2>/dev/null)"
+      if [[ -n "$_old" ]] && kill -0 "$_old" 2>/dev/null \
+         && ps -o command= -p "$_old" 2>/dev/null | grep -q 'claude-limit-watch'; then
+        echo "já existe um claude-limit-watch rodando (PID $_old). Saindo." >&2
+        exit 1
+      fi
+      rm -f "$PID_FILE"          # dono morto/estranho: limpa e tenta criar de novo
+    done
+    trap 'rm -f "$PID_FILE"' EXIT
     log "👀 Vigiando limites do Claude Code via /usage (intervalo ${INTERVAL}s).${TG_TOKEN:+ Telegram ON.} Ctrl+C para parar."
     while true; do
       check_once

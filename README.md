@@ -32,6 +32,8 @@ Current week (Sonnet only): 0% used
 
 > ℹ️ A resposta do `/usage` em modo `-p` é **gerada pelo modelo**, então às vezes vem vazia ou sem os percentuais. Por isso cada ciclo tenta ler até `FETCH_RETRIES` vezes (padrão 3) antes de pular o ciclo; leituras inválidas são ignoradas sem disparar alerta falso.
 
+> ⚠️ **Instância única:** o modo `watch` recusa iniciar se já houver **outro** `claude-limit-watch` rodando (pidfile em `$STATE_DIR`) ou se o `token_monitor.py` já estiver medindo em modo watch — dois medidores duplicariam as leituras que acabam na tabela `meter` (via `watch.log`/`ingest`) e as notificações. Prefira um só medidor: `token_monitor.py agent install` (abaixo).
+
 ## Como ele detecta um reset
 
 Para cada janela (5h e semanal), dispara uma notificação quando:
@@ -187,6 +189,8 @@ Para o watcher subir junto com o sistema e reiniciar sozinho:
 
 ### macOS — launchd
 
+> Para o watcher **Python** (`meter --watch`, recomendado), não crie o plist na mão: `~/.claude/tools/token_monitor.py agent install` faz tudo (ver seção do monitor). O plist abaixo é para o watcher **shell**.
+
 Crie `~/Library/LaunchAgents/com.claude.limitwatch.plist` (ajuste o caminho do script):
 
 ```xml
@@ -264,7 +268,7 @@ Por convenção fica em `~/.claude/tools/token_monitor.py` (a cópia versionada 
 ./deploy.sh   # cnp/token_monitor.py → ~/.claude/tools/token_monitor.py (override: CLAUDE_TOOLS_DIR)
 ```
 
-> Reinicie qualquer `--watch` em execução após o deploy: um loop já rodando mantém o código antigo carregado em memória.
+> **Instância única & versão sempre atual:** os modos contínuos (`watch`, `meter --watch`, `codex-meter --watch`) usam um lock (`flock` em `~/.claude/tools/token_monitor.watch.lock`) — dois watchers ao mesmo tempo duplicariam leituras do medidor e notificações. A **instância nova vence**: ao subir, ela encerra o watcher antigo e assume (só encerra processos cuja linha de comando contenha `token_monitor`). Além disso, o loop confere a cada segundo se o `deploy.sh` publicou uma versão nova do script e, se sim, **re-executa a si mesmo** no mesmo PID (o lock é herdado através do `exec`) — não é mais preciso reiniciar o `--watch` na mão após o deploy. Se o watcher roda pelo `agent` (launchd, abaixo), o `deploy.sh` ainda dá um `kickstart` para a troca ser imediata.
 
 ### Hooks do Claude Code (manter o banco fresco)
 
@@ -305,8 +309,10 @@ Use o caminho absoluto do wrapper no `command`. O `SessionStart` mantém o banco
 | `calibrate` | Aprende o fator de custo real por modelo a partir de gastos reais de crédito (`--brl`/`--usd`, `--solve`, `--apply`). |
 | `bursts` | Detalha clusters de atividade (gatilho manual × wakeup × task, billing, modelos, cap). |
 | `dashboard` | Gera um **dashboard HTML autocontido** (CSS+SVG inline, custo zero — só lê o SQLite): status Claude+Codex com veredito do gate, custo/dia (14d, ~USD calibrado), custo por modelo (7d), sparkline do medidor 5h (24h), billing e eventos recentes. `--open` abre no navegador; `--out`/`DASHBOARD_PATH` mudam o destino (default `~/.claude/tools/dashboard.html`). |
+| `plan` | Registra/consulta o **plano da assinatura e as renovações** (`--set max_20x --renewed '2026-07-02 12:12'`, fuso `METER_TZ`). O instante da renovação refina o billing: a renovação zera o medidor, então um episódio de crédito que a atravessaria é **cortado ali** (depois dela é assinatura de novo). O plano vira rótulo em `status`, nos alertas e no dashboard. |
+| `agent` | Watcher **gerenciado pelo launchd** (macOS): `agent install` cria e sobe um LaunchAgent (`com.gtsouza.token-monitor`) rodando `meter --watch` — uma instância por label, sobe no login e **ressuscita sozinho** se morrer (`KeepAlive`). `agent status`/`restart`/`uninstall` completam o ciclo. |
 
-> **Billing assinatura × crédito:** o monitor marca como `credits` o uso real produzido **depois** do medidor 5h ser confirmado em 100%, e como `subscription` o resto. Os relatórios `--by billing` e os custos `~USD` (calibrados via `calibrate`) saem desse cruzamento.
+> **Billing assinatura × crédito:** o monitor marca como `credits` o uso real produzido **depois** do medidor 5h ser confirmado em 100%, e como `subscription` o resto — com o corte na **renovação da assinatura** registrada via `plan`. Os relatórios `--by billing` e os custos `~USD` (calibrados via `calibrate`) saem desse cruzamento.
 
 > **Fuso nos relatórios:** o eixo `--by day` e o `--since YYYY-MM-DD` (em `report` e `codex-report`) usam o **fuso local** (`METER_TZ`), não UTC — a atividade da madrugada local fica no dia certo. Um `--since` com datetime ISO completo (com tz) é respeitado como dado.
 
@@ -328,6 +334,8 @@ Use o caminho absoluto do wrapper no `command`. O `SessionStart` mantém o banco
 | `FACTORS_PATH` | `~/.claude/tools/pricing_factors.json` | Onde `calibrate --apply` grava os fatores de custo por modelo. |
 | `CODEX_SESSIONS_DIR` | `~/.codex/sessions` | Diretório de rollouts do Codex. |
 | `DASHBOARD_PATH` | `~/.claude/tools/dashboard.html` | Saída padrão do subcomando `dashboard`. |
+| `TOKEN_MONITOR_LOCK` | `~/.claude/tools/token_monitor.watch.lock` | Lock de instância única dos modos `watch`/`--watch`. |
+| `TOKEN_MONITOR_LAUNCHD_LABEL` | `com.gtsouza.token-monitor` | Label do LaunchAgent criado por `agent install`. |
 
 ### Gate de rate limit (para runners)
 

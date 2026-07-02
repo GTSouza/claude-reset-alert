@@ -35,6 +35,17 @@ Uso — medidor oficial (porte do claude-limit-watch.sh, custo zero) + Codex (ro
   python3 token_monitor.py status             # resumo num olhar: Claude + Codex + veredito do gate(both)
   python3 token_monitor.py gate --provider both   # PAUSE se Claude OU Codex estourar (default --provider claude)
 
+Uso — plano/assinatura e watcher gerenciado:
+  python3 token_monitor.py plan --set max_20x --renewed '2026-07-02 12:12'  # registra renovação (fuso METER_TZ)
+  python3 token_monitor.py plan               # plano atual + histórico de renovações
+  python3 token_monitor.py agent install      # watcher via launchd (macOS): 1 instância, sobe no login, ressuscita
+  python3 token_monitor.py agent status|restart|uninstall
+
+Instância única & versão: os modos watch (watch, meter --watch, codex-meter --watch)
+usam um lock (flock) — dois watchers duplicariam leituras do medidor e notificações.
+A instância NOVA vence (a antiga é encerrada), e o loop detecta um deploy novo do
+script e re-executa a si mesmo — o watcher de longa duração roda SEMPRE a última versão.
+
 Uso — calibração de custo (aprende fator por modelo dos gastos REAIS):
   python3 token_monitor.py calibrate --brl 47.85          # registra episódio (janela=último crédito)
   python3 token_monitor.py calibrate --solve              # resolve fatores por modelo (simula)
@@ -48,7 +59,8 @@ Janelas (--window): 5h | day | week | month
   snapshot do app; (3) o app omite cache. Validação: Sonnet 4.6 bate exato (73.1k in / 6.2M out).
 Custo: base PRICING × fator do modelo (calibrado); ~USD. Modelo sem dado real = fator 1.0.
 Billing: token real enquanto medidor 5h==100% (após cap confirmado) = crédito; senão assinatura.
-Env úteis: METER_TZ, CREDIT_PCT, RESET_TOLERANCE, DROP_THRESHOLD, FACTORS_PATH, CODEX_SESSIONS_DIR.
+Env úteis: METER_TZ, CREDIT_PCT, RESET_TOLERANCE, DROP_THRESHOLD, FACTORS_PATH, CODEX_SESSIONS_DIR,
+TOKEN_MONITOR_LOCK (lock de instância única dos modos watch), TOKEN_MONITOR_LAUNCHD_LABEL.
 """
 from __future__ import annotations
 
@@ -60,10 +72,16 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
 import time
+
+try:
+    import fcntl                       # instância única dos modos watch (Unix)
+except ImportError:  # pragma: no cover (Windows: segue sem lock)
+    fcntl = None
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -282,6 +300,14 @@ def db_connect() -> sqlite3.Connection:
             mtime REAL,
             size INTEGER,
             offset INTEGER           -- byte após a última linha completa lida
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS plan_renewals (
+            ts_epoch REAL PRIMARY KEY,   -- instante da renovação da assinatura (epoch UTC)
+            ts TEXT,                     -- ISO UTC
+            plan TEXT,                   -- ex.: max_20x
+            note TEXT
         )
     """)
     # Migração: coluna billing_source (subscription | credits) sem recriar o banco.
@@ -511,6 +537,27 @@ def ingest_watchlog(con: sqlite3.Connection) -> int:
 CREDIT_PCT = int(os.environ.get("CREDIT_PCT", "100"))
 
 
+def plan_renewal_epochs(con: sqlite3.Connection) -> list[float]:
+    """Instantes de renovação da assinatura (`plan --set ... --renewed ...`), crescente.
+    Uma renovação zera o medidor na hora — nenhum episódio de crédito a atravessa."""
+    try:
+        return [r[0] for r in con.execute(
+            "SELECT ts_epoch FROM plan_renewals ORDER BY ts_epoch")]
+    except sqlite3.OperationalError:     # banco antigo/de teste sem a tabela
+        return []
+
+
+def current_plan(con: sqlite3.Connection) -> tuple[str | None, float | None]:
+    """(plano, epoch da última renovação) — (None, None) se nunca registrado."""
+    try:
+        row = con.execute(
+            "SELECT plan, ts_epoch FROM plan_renewals ORDER BY ts_epoch DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return (None, None)
+    return (row[0], row[1]) if row else (None, None)
+
+
 def compute_billing(con: sqlite3.Connection) -> int:
     """Marca usage.billing_source via MEDIDOR OFICIAL (tabela meter), não por banners.
 
@@ -558,6 +605,7 @@ def credit_episodes(con: sqlite3.Connection) -> list[tuple[float, float]]:
     if not meters:
         return []
     now = datetime.now(timezone.utc).timestamp()
+    renewals = plan_renewal_epochs(con)
     episodes = []
     i, n = 0, len(meters)
     while i < n:
@@ -574,7 +622,18 @@ def credit_episodes(con: sqlite3.Connection) -> list[tuple[float, float]]:
             # dá intervalo NÃO-degenerado mesmo num streak de 1 leitura (senão (x, x]
             # seria vazio e zeraria o crédito). Ainda capado (sem <100% depois) =>
             # credita até agora.
-            cap_end = (last_100 + meters[j][0]) / 2.0 if j < n else now
+            gap_end = meters[j][0] if j < n else now
+            cap_end = (last_100 + gap_end) / 2.0 if j < n else now
+            # Renovação da assinatura dentro do episódio encerra o crédito ALI: a
+            # renovação zera o medidor na hora, então tudo depois dela é assinatura —
+            # e o instante informado (plan --renewed) é mais preciso que o ponto
+            # médio entre polls. A janela do corte vai até gap_end (a 1ª leitura
+            # <100%), não até o ponto médio: uma renovação na 2ª metade do gap de
+            # poll ainda é o fim real do episódio.
+            for r in renewals:
+                if cap_start < r <= gap_end:
+                    cap_end = r
+                    break
             # só é crédito se houve token real ESTRITAMENTE após o 100% confirmado
             if cap_end > cap_start and _real_output_tokens(con, cap_start, cap_end) > 0:
                 episodes.append((cap_start, cap_end))
@@ -1181,6 +1240,7 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
             _RESET_UNPARSED_WARNED.add(txt)
             print(f"⚠️  horário de reset não interpretável: {txt!r} — alertas de reset/cap "
                   f"desta janela ficam mudos até o formato ser suportado.")
+    plan_name, _ = current_plan(con)     # rótulo do plano nos alertas (ex.: max_20x)
     events = []
     if prev:
         # p_spct/p_sre/p_wpct/p_wre já desempacotados do prev (6 colunas) acima.
@@ -1206,14 +1266,14 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
             if pct is not None and rep and p_rep and not est_prev and rep - p_rep > RESET_TOLERANCE:
                 # reset com horário NOVO já conhecido (o /usage reporta o próximo reset).
                 events.append(ev_reset)
-                _notify(*_meter_alert("Claude Code", None, "reset", win, pct, reset_txt, early=early, prev_reset=prev_reset_txt), tg=notify)
+                _notify(*_meter_alert("Claude Code", plan_name, "reset", win, pct, reset_txt, early=early, prev_reset=prev_reset_txt), tg=notify)
             elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
                 if round(pct) == 0:
                     # zerou = reset (natural ou antecipado); o horário pode ainda estar ausente
                     # (reset ?) — o reconfirm tenta recuperá-lo, e se não vier, um poll saudável
                     # seguinte preenche o horário na tabela.
                     events.append(ev_reset)
-                    _notify(*_meter_alert("Claude Code", None, "reset", win, pct, reset_txt, early=early, prev_reset=prev_reset_txt), tg=notify)
+                    _notify(*_meter_alert("Claude Code", plan_name, "reset", win, pct, reset_txt, early=early, prev_reset=prev_reset_txt), tg=notify)
                 else:
                     # queda parcial (não zerou) = cota liberou, não é reset completo. Marca ⚠️
                     # quando cai LONGE (±30min) do reset previsto — drop suspeito, fora da janela
@@ -1221,7 +1281,7 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
                     # marca, senão a deriva de formato viria com ⚠️ indevido.
                     events.append(f"drop_{key}")
                     far = p_rep is not None and abs(now.timestamp() - p_rep) >= 1800
-                    _notify(*_meter_alert("Claude Code", None, "drop", win, pct, reset_txt, p_pct, flagged=far), tg=notify)
+                    _notify(*_meter_alert("Claude Code", plan_name, "drop", win, pct, reset_txt, p_pct, flagged=far), tg=notify)
 
         # (1) janela 5h ATINGIU 100% (transição <100 -> 100). Compara com a última leitura
         # de % NÃO-NULA (não só a linha imediatamente anterior): se o poll anterior falhou
@@ -1233,7 +1293,7 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
         last_spct = last_spct_row[0] if last_spct_row else None
         if s_pct is not None and s_pct >= CREDIT_PCT and last_spct is not None and last_spct < CREDIT_PCT:
             events.append("cap_5h")
-            _notify(*_meter_alert("Claude Code", None, "cap", "5h", s_pct, s_reset), tg=notify)
+            _notify(*_meter_alert("Claude Code", plan_name, "cap", "5h", s_pct, s_reset), tg=notify)
 
     # (2) CRÉDITOS EM USO: medidor a 100% + tokens reais novos após o início do cap.
     # Com excedente desligado, 100% = robô para; logo, token a 100% = crédito.
@@ -1257,7 +1317,7 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
         ).fetchone()[0]
         if tok > 0 and not already:
             events.append("credits_started")
-            _notify(*_meter_alert("Claude Code", None, "credits", "5h", s_pct, s_reset, n_tok=tok), tg=notify)
+            _notify(*_meter_alert("Claude Code", plan_name, "credits", "5h", s_pct, s_reset, n_tok=tok), tg=notify)
 
     if did_reconfirm:
         events.append("reconfirm")          # marca p/ o cooldown do próximo poll
@@ -2233,6 +2293,11 @@ def dashboard(con: sqlite3.Connection, args) -> None:
 
     tzname = METER_TZ
     gen = datetime.now(_meter_tz()).strftime("%Y-%m-%d %H:%M:%S")
+    plan_name, renewed = current_plan(con)
+    plan_chip = ""
+    if plan_name:
+        rlocal = datetime.fromtimestamp(renewed, tz=_meter_tz()).strftime("%Y-%m-%d %H:%M")
+        plan_chip = f" · plano {_html.escape(plan_name)} (renovado {rlocal})"
     cards = ""
     if cl:
         cards += _dash_provider_card("Claude", cl["s_pct"], cl["s_reset"], cl["w_pct"], cl["w_reset"])
@@ -2260,7 +2325,7 @@ def dashboard(con: sqlite3.Connection, args) -> None:
 <title>claude-reset-alert · dashboard</title>
 <style>{_DASH_CSS}</style></head><body>
 <h1>claude-reset-alert <span class="badge {vcls}">{verdict}</span></h1>
-<div class="sub">gerado {gen} ({tzname}) · gate 5h&lt;80% · semanal&lt;90% · leituras em cache (sem chamada /usage)</div>
+<div class="sub">gerado {gen} ({tzname}){plan_chip} · gate 5h&lt;80% · semanal&lt;90% · leituras em cache (sem chamada /usage)</div>
 <div class="cards">{cards}</div>
 <h2>Custo por dia — últimos 14 dias (~USD calibrado)</h2>
 {_dash_daily_svg(days)}
@@ -2285,14 +2350,244 @@ def dashboard(con: sqlite3.Connection, args) -> None:
             subprocess.run([opener, str(out)], capture_output=True)
 
 
+# ----------------- Instância única + versão (modos watch) ------------------ #
+# Dois watchers simultâneos duplicam leituras (linhas extras em meter/codex_meter)
+# e notificações. Um lock (flock) garante UM processo em modo watch por vez, com a
+# regra "a instância NOVA vence": quem chega encerra o dono anterior e assume — um
+# relançamento pós-deploy nunca fica bloqueado por um watcher velho. Além disso o
+# loop confere a cada segundo se o deploy publicou um script novo e, se sim,
+# re-executa a si mesmo (mesmo PID, lock preservado via herança do fd): o watcher
+# de longa duração roda SEMPRE a última versão publicada.
+WATCH_LOCK_PATH = Path(os.environ.get(
+    "TOKEN_MONITOR_LOCK", str(Path.home() / ".claude" / "tools" / "token_monitor.watch.lock")))
+_LOCK_FD_ENV = "TOKEN_MONITOR_WATCH_LOCK_FD"
+SCRIPT_PATH = Path(__file__).resolve()
+
+
+def _script_stamp() -> tuple[int, int] | None:
+    """(mtime_ns, size) do próprio script — identidade da versão publicada."""
+    try:
+        st = SCRIPT_PATH.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+_SCRIPT_STAMP = _script_stamp()
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _read_lock_pid(fd: int) -> int | None:
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        return int(json.loads(os.read(fd, 4096).decode("utf-8", "replace"))["pid"])
+    except Exception:
+        return None
+
+
+def _write_lock_meta(fd: int) -> None:
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, json.dumps({
+        "pid": os.getpid(),
+        "argv": sys.argv[1:],
+        "script": str(SCRIPT_PATH),
+        "started": datetime.now(timezone.utc).isoformat(),
+    }).encode())
+
+
+# .* entre o subcomando e o --watch: a ordem das flags não é fixa
+# ("meter --interval 60 --watch" também é um watcher).
+_WATCH_PGREP = r"token_monitor\.py (meter|codex-meter) .*--watch|token_monitor\.py watch"
+_SHELL_WATCH_PGREP = r"claude-limit-watch(-linux)?\.sh"
+
+
+def _sweep_legacy_watchers() -> None:
+    """Encerra medidores que não participam do protocolo do flock: watchers
+    token_monitor de versões PRÉ-LOCK (ex.: nohup antigos) e watchers SHELL
+    (claude-limit-watch), cujas leituras acabam na mesma tabela meter via
+    watch.log/ingest — qualquer um deles em dupla duplicaria os dados."""
+    for pattern, marker, kind in ((_WATCH_PGREP, "token_monitor", "token_monitor legado sem lock"),
+                                  (_SHELL_WATCH_PGREP, "claude-limit-watch", "watcher shell")):
+        try:
+            out = subprocess.run(["pgrep", "-f", pattern],
+                                 capture_output=True, text=True, timeout=5)
+            pids = [int(x) for x in out.stdout.split() if x.isdigit()]
+        except Exception:
+            continue
+        for pid in pids:
+            if pid == os.getpid():
+                continue
+            cmd = _proc_cmdline(pid)
+            if marker not in cmd:
+                continue
+            print(f"⚠️  encerrando {kind} (PID {pid}): {cmd[:120]}", flush=True)
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def _launchd_agent_loaded() -> bool:
+    """True se o LaunchAgent do watcher está carregado no launchd (macOS)."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        return subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"],
+            capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        return False
+
+
+def acquire_watch_lock(takeover_timeout: float = 20.0, sweep: bool = True) -> int | None:
+    """Garante instância única dos modos watch; devolve o fd do lock (fica aberto
+    pela vida do processo e é herdado através do re-exec de versão nova).
+    sweep=False pula a varredura de watchers legados (testes usam, p/ não tocar
+    em processos reais da máquina).
+
+    Se outro watcher segura o lock, a instância NOVA vence: SIGTERM no dono (e
+    SIGKILL perto do prazo) até o lock liberar. Só encerra processos cuja linha de
+    comando contenha 'token_monitor' — um PID alheio no lock aborta em vez de matar."""
+    if fcntl is None:                    # plataforma sem flock: segue sem garantia
+        return None
+    # fd herdado através do os.execv (deploy detectado): adota sem nunca soltar o
+    # lock — não existe janela em que outra instância pudesse entrar no meio.
+    inherited = os.environ.pop(_LOCK_FD_ENV, None)
+    if inherited is not None:
+        try:
+            fd = int(inherited)
+        except ValueError:
+            fd = None
+        if fd is not None:
+            try:
+                st_fd, st_path = os.fstat(fd), os.stat(WATCH_LOCK_PATH)
+                if (st_fd.st_dev, st_fd.st_ino) != (st_path.st_dev, st_path.st_ino):
+                    raise OSError("fd herdado não aponta para o lock atual")
+                # confirma a posse: re-flock no mesmo open file description é
+                # no-op se já é nosso; falha se outro processo o segura (env
+                # velha/incorreta) — aí cai no caminho normal de aquisição.
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                os.set_inheritable(fd, True)
+                # meta é só informativa: falha ao escrevê-la (ex.: ENOSPC) não
+                # pode derrubar uma posse já garantida pelo flock.
+                with contextlib.suppress(OSError):
+                    _write_lock_meta(fd)
+                return fd
+            except OSError:
+                # fecha SEMPRE: um fd vivo mas não adotado poderia segurar o
+                # flock e fazer o processo disputar o lock contra si mesmo.
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+    WATCH_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(WATCH_LOCK_PATH), os.O_RDWR | os.O_CREAT, 0o644)
+    os.set_inheritable(fd, True)         # sobrevive ao os.execv do re-exec
+    deadline = time.monotonic() + takeover_timeout
+    said = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            pass
+        holder = _read_lock_pid(fd)
+        if holder and holder != os.getpid():
+            cmd = _proc_cmdline(holder)
+            if cmd and "token_monitor" not in cmd:
+                os.close(fd)
+                sys.exit(f"lock {WATCH_LOCK_PATH} preso pelo PID {holder}, que não parece ser "
+                         f"um token_monitor ({cmd!r}); nada foi encerrado — investigue.")
+            if not said:
+                print(f"⚠️  outro watcher ativo (PID {holder}); assumindo o lugar — "
+                      f"instância nova vence.", flush=True)
+                if _launchd_agent_loaded():
+                    print("ℹ️  o LaunchAgent está instalado: o launchd vai ressuscitar o watcher "
+                          "gerenciado e ELE reassume (~30s). Para trocar de versão use "
+                          "`agent restart`; para rodar manual, `agent uninstall` antes.", flush=True)
+                said = True
+            try:
+                os.kill(holder, signal.SIGTERM if time.monotonic() < deadline - 5 else signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if time.monotonic() > deadline:
+            os.close(fd)
+            sys.exit(f"não consegui o lock de watcher em {takeover_timeout:.0f}s "
+                     f"({WATCH_LOCK_PATH}); verifique o processo dono e tente de novo.")
+        time.sleep(0.3)
+    _write_lock_meta(fd)
+    if sweep:
+        _sweep_legacy_watchers()
+    return fd
+
+
+def _reexec_latest(lock_fd: int | None) -> None:
+    """Substitui o processo pela versão recém-publicada (mesmo PID e argv).
+    O fd do lock é herdado via env — a instância única nunca solta o lock."""
+    if lock_fd is not None:
+        os.set_inheritable(lock_fd, True)
+        os.environ[_LOCK_FD_ENV] = str(lock_fd)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # sys.orig_argv preserva as flags do interpretador (ex.: o -u do LaunchAgent,
+    # sem o qual o log do launchd ficaria bufferizado após o 1º self-update).
+    try:
+        os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+    except OSError as e:
+        # exec falhou (ex.: interpretador movido): segue vivo na versão atual —
+        # um watcher parado é pior do que um watcher desatualizado.
+        os.environ.pop(_LOCK_FD_ENV, None)
+        print(f"⚠️  re-exec falhou ({e}); seguindo na versão atual.", flush=True)
+
+
+def _script_compiles() -> bool:
+    """Checagem de sintaxe da versão publicada, sem executá-la nem gravar .pyc."""
+    try:
+        compile(SCRIPT_PATH.read_bytes(), str(SCRIPT_PATH), "exec")
+        return True
+    except (OSError, SyntaxError, ValueError):
+        return False
+
+
 # ----------------------------- CLI ----------------------------------------- #
-def _watch_loop(label: str, interval: int, step) -> None:
+def _watch_loop(label: str, interval: int, step, lock_fd: int | None = None) -> None:
     print(f"{label} a cada {interval}s (Ctrl-C para sair)")
+    # SIGTERM chega no takeover (outra instância assumiu) ou no kickstart do
+    # launchd — sem o handler, o lado que perde morre MUDO no log.
+    with contextlib.suppress(ValueError, OSError):   # ValueError: fora da main thread
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(
+            "encerrado (SIGTERM) — outra instância assumiu o lock ou o launchd reiniciou o watcher."))
+    prev_stamp = _SCRIPT_STAMP          # última leitura, p/ exigir 2 ticks estáveis
+    warned_stamp = None
     try:
         while True:
             print(f"── {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ──")
             step()
-            time.sleep(interval)
+            # dorme em fatias de 1s conferindo se o deploy publicou versão nova; se
+            # mudou, re-exec no mesmo PID (lock preservado). Só re-exec com o stamp
+            # ESTÁVEL por 2 leituras e sintaxe válida: um `cp` não-atômico em pleno
+            # andamento não pode virar execv de um arquivo truncado.
+            end = time.monotonic() + interval
+            while time.monotonic() < end:
+                cur = _script_stamp()
+                if (cur is not None and cur != _SCRIPT_STAMP
+                        and cur == prev_stamp and cur != warned_stamp):
+                    if _script_compiles():
+                        print("🔁 nova versão do token_monitor publicada; reiniciando…", flush=True)
+                        _reexec_latest(lock_fd)
+                    else:
+                        warned_stamp = cur   # avisa/compila 1x por versão ruim
+                        print("⚠️  versão publicada com sintaxe inválida; seguindo na atual "
+                              "(re-tento quando o arquivo mudar de novo).", flush=True)
+                prev_stamp = cur
+                time.sleep(1)
     except KeyboardInterrupt:
         print("\nencerrado.")
 
@@ -2365,6 +2660,149 @@ def codex_report(con: sqlite3.Connection, args) -> None:
     print("\nCodex é assinatura (sem custo/token); 'tempo' = ativo (1º->último evento por sessão).\n")
 
 
+def plan_cmd(con: sqlite3.Connection, args) -> None:
+    """Registra/consulta o plano da assinatura e as renovações (tabela plan_renewals).
+
+    O instante exato da renovação refina o billing: `credit_episodes()` corta o
+    episódio de crédito na renovação (depois dela é assinatura de novo), e o plano
+    vira rótulo em status/alertas/dashboard."""
+    if getattr(args, "remove", None):
+        when = _since_epoch_local(args.remove)
+        # tolerância de 60s: o usuário digita o minuto que o `plan` lista, não o epoch exato
+        row = con.execute(
+            "SELECT ts_epoch, plan FROM plan_renewals WHERE ts_epoch BETWEEN ? AND ?",
+            (when - 60, when + 60)).fetchone()
+        if not row:
+            sys.exit(f"nenhuma renovação encontrada perto de {args.remove} — veja a lista com `plan`.")
+        con.execute("DELETE FROM plan_renewals WHERE ts_epoch = ?", (row[0],))
+        con.commit()
+        n = compute_billing(con)         # desfaz o corte no billing
+        print(f"✅ renovação removida ({row[1]}) — billing reclassificado ({n} msgs em crédito).")
+        return
+    if getattr(args, "set_plan", None):
+        renewed = getattr(args, "renewed", None)
+        when = _since_epoch_local(renewed) if renewed else datetime.now(timezone.utc).timestamp()
+        ts_iso = datetime.fromtimestamp(when, tz=timezone.utc).isoformat()
+        con.execute("INSERT OR REPLACE INTO plan_renewals VALUES (?,?,?,?)",
+                    (when, ts_iso, args.set_plan, getattr(args, "note", None)))
+        con.commit()
+        n = compute_billing(con)         # reclassifica assinatura×créditos com o corte novo
+        local = datetime.fromtimestamp(when, tz=_meter_tz()).strftime("%Y-%m-%d %H:%M")
+        print(f"✅ renovação registrada: {args.set_plan} em {local} ({METER_TZ}) — "
+              f"billing reclassificado ({n} msgs em crédito).")
+        return
+    if getattr(args, "renewed", None) or getattr(args, "note", None):
+        sys.exit("--renewed/--note só fazem sentido com --set PLANO (nada foi gravado).")
+    rows = con.execute(
+        "SELECT ts_epoch, plan, note FROM plan_renewals ORDER BY ts_epoch DESC LIMIT 20"
+    ).fetchall()
+    if not rows:
+        print("nenhuma renovação registrada — use: plan --set max_20x --renewed 'YYYY-MM-DD HH:MM'")
+        return
+    last_local = datetime.fromtimestamp(rows[0][0], tz=_meter_tz()).strftime("%Y-%m-%d %H:%M")
+    print(f"plano atual: {rows[0][1]} (renovado {last_local} {METER_TZ})")
+    for e, p, note in rows:
+        local = datetime.fromtimestamp(e, tz=_meter_tz()).strftime("%Y-%m-%d %H:%M")
+        print(f"  · {local}  {p}{'  — ' + note if note else ''}")
+
+
+# --------------------- Watcher gerenciado (launchd, macOS) ------------------ #
+LAUNCHD_LABEL = os.environ.get("TOKEN_MONITOR_LAUNCHD_LABEL", "com.gtsouza.token-monitor")
+
+
+def _stable_python3() -> str:
+    """Interpretador p/ o plist do launchd: um caminho ESTÁVEL de sistema/homebrew,
+    não o da sessão de instalação — um venv apagado ou um PATH exótico gravado no
+    plist viraria crash-loop eterno do KeepAlive."""
+    override = os.environ.get("TOKEN_MONITOR_PYTHON")
+    if override:
+        return override
+    for cand in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"):
+        if os.path.exists(cand):
+            return cand
+    return shutil.which("python3") or sys.executable
+
+
+def agent_cmd(args) -> None:
+    """Gerencia o watcher como LaunchAgent do macOS (launchd).
+
+    launchd fecha as garantias que o processo sozinho não fecha: sobe no login,
+    UMA instância por label e ressuscita o watcher se ele morrer (KeepAlive).
+    Com o flock (contra lançamentos manuais duplicados) e o re-exec pós-deploy
+    (versão sempre atual), o watcher fica único, vivo e atualizado."""
+    if sys.platform != "darwin":
+        sys.exit("agent: só macOS (launchd). Em Linux, use um systemd user service equivalente.")
+    plist = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+    domain = f"gui/{os.getuid()}"
+    service = f"{domain}/{LAUNCHD_LABEL}"
+    if args.action == "install":
+        py = _stable_python3()
+        runtime = Path(os.environ.get("CLAUDE_TOOLS_DIR",
+                                      str(Path.home() / ".claude" / "tools"))) / "token_monitor.py"
+        logf = Path.home() / ".claude" / "limit-watch" / "meter-watch.log"
+        logf.parent.mkdir(parents=True, exist_ok=True)
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        plist.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{py}</string>
+    <string>-u</string>
+    <string>{runtime}</string>
+    <string>meter</string>
+    <string>--watch</string>
+    <string>--interval</string>
+    <string>{int(args.interval)}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict><key>PYTHONUNBUFFERED</key><string>1</string></dict>
+  <key>StandardOutPath</key><string>{logf}</string>
+  <key>StandardErrorPath</key><string>{logf}</string>
+</dict>
+</plist>
+""")
+        subprocess.run(["launchctl", "bootout", service], capture_output=True)
+        r = subprocess.run(["launchctl", "bootstrap", domain, str(plist)],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"launchctl bootstrap falhou: {(r.stderr or r.stdout).strip()}")
+        print(f"✅ LaunchAgent instalado e iniciado ({service})\n"
+              f"   plist: {plist}\n   log:   {logf}")
+    elif args.action == "restart":
+        r = subprocess.run(["launchctl", "kickstart", "-k", service],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"launchctl kickstart falhou: {(r.stderr or r.stdout).strip()} "
+                     f"— o agent está instalado? (agent install)")
+        print(f"✅ watcher reiniciado ({service})")
+    elif args.action == "status":
+        r = subprocess.run(["launchctl", "print", service], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"agent NÃO instalado/carregado ({service}) — instale com: agent install")
+            return
+        # só a 1ª ocorrência de cada chave: o `launchctl print` tem sub-blocos
+        # aninhados com linhas 'state =' próprias que confundiriam a saída.
+        seen: dict[str, str] = {}
+        for ln in r.stdout.splitlines():
+            m = re.match(r"^\s*(state|pid|last exit code|path)\s*=", ln)
+            if m and m.group(1) not in seen:
+                seen[m.group(1)] = ln.strip()
+        print(f"agent carregado ({service})")
+        for ln in seen.values():
+            print(f"  {ln}")
+    elif args.action == "uninstall":
+        subprocess.run(["launchctl", "bootout", service], capture_output=True)
+        plist.unlink(missing_ok=True)
+        print(f"✅ LaunchAgent removido ({service})")
+
+
 def status(con: sqlite3.Connection, args) -> None:
     """Resumo de um olhar: Claude + Codex (5h/semanal) + veredito do gate (both).
 
@@ -2376,6 +2814,10 @@ def status(con: sqlite3.Connection, args) -> None:
     cl = _claude_reading(con, args)
     co = _codex_reading(args)
     print(f"\n=== Status — Claude + Codex (gate 5h<{g5}% · semanal<{gw}%) ===\n")
+    plan_name, renewed = current_plan(con)
+    if plan_name:
+        local = datetime.fromtimestamp(renewed, tz=_meter_tz()).strftime("%Y-%m-%d %H:%M")
+        print(f"🪪 plano Claude: {plan_name} · renovado {local} ({METER_TZ})\n")
 
     pauses = []
     any_valid = False
@@ -2498,6 +2940,19 @@ def main() -> None:
     bp.add_argument("--gap", type=int, default=1200, help="segundos de inatividade que separam bursts (default 1200=20min)")
     bp.add_argument("--utc", action="store_true", help="exibir em UTC (default: horário local METER_TZ)")
 
+    pp = sub.add_parser("plan", help="plano da assinatura + renovações (o crédito termina na renovação)")
+    pp.add_argument("--set", dest="set_plan", metavar="PLANO",
+                    help="registra uma renovação deste plano (ex.: max_20x)")
+    pp.add_argument("--renewed", metavar="QUANDO",
+                    help=f"instante da renovação, 'YYYY-MM-DD HH:MM' no fuso {METER_TZ} (default: agora)")
+    pp.add_argument("--note", help="observação livre")
+    pp.add_argument("--remove", metavar="QUANDO",
+                    help="remove a renovação registrada nesse instante (±60s) e reclassifica o billing")
+
+    agp = sub.add_parser("agent", help="watcher gerenciado pelo launchd (macOS): 1 instância, sobe no login, ressuscita")
+    agp.add_argument("action", choices=["install", "status", "restart", "uninstall"])
+    agp.add_argument("--interval", type=int, default=300, help="intervalo do meter --watch em segundos (default 300)")
+
     args = ap.parse_args()
     con = db_connect()
 
@@ -2519,7 +2974,8 @@ def main() -> None:
     elif args.cmd == "limits":
         limits(con, args)
     elif args.cmd == "watch":
-        _watch_loop("watch: ingest", args.interval, lambda: ingest(con))
+        lock_fd = acquire_watch_lock()
+        _watch_loop("watch: ingest", args.interval, lambda: ingest(con), lock_fd=lock_fd)
     elif args.cmd == "meter":
         notify = not args.no_notify
         with_codex = (not args.no_codex) and CODEX_SESSIONS_DIR.exists()
@@ -2533,7 +2989,9 @@ def main() -> None:
                 codex_tick()
             return ok
         if args.watch:
-            _watch_loop("meter: /usage" + (" + codex" if with_codex else ""), args.interval, _meter_tick)
+            lock_fd = acquire_watch_lock()
+            _watch_loop("meter: /usage" + (" + codex" if with_codex else ""), args.interval,
+                        _meter_tick, lock_fd=lock_fd)
         else:
             _meter_tick()
     elif args.cmd == "meter-report":
@@ -2541,8 +2999,9 @@ def main() -> None:
     elif args.cmd == "codex-meter":
         notify = not args.no_notify
         if args.watch:
+            lock_fd = acquire_watch_lock()
             _watch_loop("codex-meter", args.interval,
-                        _make_codex_tick(con, notify, auto_refresh=True))
+                        _make_codex_tick(con, notify, auto_refresh=True), lock_fd=lock_fd)
         else:
             if getattr(args, "refresh", False):
                 # com --json o stdout é só o JSON; o progresso humano vai p/ stderr
@@ -2571,6 +3030,10 @@ def main() -> None:
         bursts_report(con, args)
     elif args.cmd == "calibrate":
         calibrate(con, args)
+    elif args.cmd == "plan":
+        plan_cmd(con, args)
+    elif args.cmd == "agent":
+        agent_cmd(args)
     con.close()
 
 
