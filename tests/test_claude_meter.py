@@ -200,6 +200,40 @@ class ResetClassificationTest(unittest.TestCase):
         self.assertIn("liberou", self._titles(notify))
         self.assertIn("⚠️", self._titles(notify))
 
+    def test_infers_reset_time_when_missing(self):
+        # reset ANTECIPADO sem horário e reconfirm não recupera => estima ~now + 5h e marca '≈'.
+        self._prev(99, self.now + 7200)
+        degraded = "Current session: 0% used\n" + self.WEEK_STABLE
+        with patch.object(tm, "_fetch_usage", return_value=degraded), \
+             patch.object(tm, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                tm.meter_once(self.con, notify=False)
+        sr, sre = self.con.execute(
+            "SELECT session_reset, session_reset_epoch FROM meter ORDER BY ts_epoch DESC LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(sre)
+        self.assertAlmostEqual(sre - self.now, 5 * 3600, delta=180)   # ~ agora + 5h
+        self.assertTrue(sr.startswith("≈"))                          # marcado como estimativa
+        self.assertIn("reset_5h_early", self._event())
+        self.assertIn("ANTECIPADO", self._titles(notify))
+
+    def test_inferred_reset_carried_forward_stable(self):
+        # o horário estimado é CARREGADO adiante (estável, sem re-inferir/drift) e não re-alerta.
+        self._prev(99, self.now + 7200)
+        degraded = "Current session: 0% used\n" + self.WEEK_STABLE
+        with patch.object(tm, "_fetch_usage", return_value=degraded), \
+             patch.object(tm, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                tm.meter_once(self.con, notify=False)               # poll1: infere
+                first = self.con.execute(
+                    "SELECT session_reset_epoch FROM meter ORDER BY ts_epoch DESC LIMIT 1").fetchone()[0]
+                n1 = notify.call_count
+                tm.meter_once(self.con, notify=False)               # poll2: carrega
+                second = self.con.execute(
+                    "SELECT session_reset_epoch FROM meter ORDER BY ts_epoch DESC LIMIT 1").fetchone()[0]
+        self.assertEqual(first, second)             # estável, não re-inferido
+        self.assertEqual(notify.call_count, n1)     # poll2 não re-alertou
+
     def test_reconfirm_recovers_glitch(self):
         # glitch transitório: 1ª leitura 0%+reset None; o reconfirm traz de volta o valor ANTIGO
         # (99% + MESMO horário) => adota, NÃO vira reset falso.

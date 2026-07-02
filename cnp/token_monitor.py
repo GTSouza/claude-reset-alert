@@ -104,6 +104,9 @@ METER_RECONFIRM = os.environ.get("METER_RECONFIRM", "1") not in ("0", "false", "
 # Cooldown (s) entre releituras de confirmação: um /usage que OSCILA degradado<->saudável não
 # deve gastar 1 haiku por poll. Limita a ~1 releitura por janela (padrão 10min >> intervalo de poll).
 RECONFIRM_COOLDOWN = int(os.environ.get("RECONFIRM_COOLDOWN", "600"))
+# Fallback: quando um reset chega SEM horário e o reconfirm não recupera, estima o próximo reset
+# como now + duração da janela (5h/7d), uma vez, e carrega adiante. METER_INFER_RESET=0 desliga.
+METER_INFER_RESET = os.environ.get("METER_INFER_RESET", "1") not in ("0", "false", "no", "")
 # telegram.env do próprio limit-watch (mesmo arquivo, reaproveitado)
 TG_ENV_FILE = Path(os.environ.get("TG_ENV_FILE", str(Path.home() / ".claude" / "limit-watch" / "telegram.env")))
 
@@ -975,11 +978,13 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
     s_pct, s_reset = _parse_line(usage, "Current session")
     w_pct, w_reset = _parse_line(usage, "Current week")
 
-    # estado anterior p/ detectar reset/queda — e p/ o reconfirm saber se ANTES havia horário.
+    # estado anterior p/ detectar reset/queda, p/ o reconfirm saber se ANTES havia horário, e
+    # p/ o fallback de inferência carregar o horário (real ou estimado) adiante.
     prev = con.execute(
-        "SELECT session_pct, session_reset_epoch, week_pct, week_reset_epoch FROM meter ORDER BY ts_epoch DESC LIMIT 1"
+        "SELECT session_pct, session_reset, session_reset_epoch, week_pct, week_reset, week_reset_epoch "
+        "FROM meter ORDER BY ts_epoch DESC LIMIT 1"
     ).fetchone()
-    p_spct, p_sre, p_wpct, p_wre = prev if prev else (None, None, None, None)
+    p_spct, p_sr_txt, p_sre, p_wpct, p_wr_txt, p_wre = prev if prev else (None, None, None, None, None, None)
 
     # RECONFIRM de leitura degradada: uma janela com % mas SEM horário de reset (reset None)
     # aparece no momento de um reset — inclusive do RESET ANTECIPADO (a Anthropic zera a cota
@@ -1025,6 +1030,27 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
 
     s_re = _reset_to_epoch(s_reset)
     w_re = _reset_to_epoch(w_reset)
+
+    # --- Fallback de inferência do horário de reset (simples, tipo Codex) ---
+    # Quando um reset chega SEM horário (o /usage não traz a linha 'resets') e o reconfirm não
+    # recuperou, estima o próximo reset como agora + a duração da janela (5h / 7d), UMA vez no
+    # momento do reset, e carrega esse valor adiante enquanto a janela seguir zerada — até um
+    # poll saudável trazer o horário real. Marca '≈' p/ deixar claro que é estimativa.
+    if METER_INFER_RESET:
+        now_ts = now.timestamp()
+        if s_pct is not None and s_re is None:
+            if p_sre is not None and p_spct is not None and round(s_pct) == round(p_spct):
+                s_reset, s_re = p_sr_txt, p_sre                  # mesma janela zerada: carrega
+            elif round(s_pct) == 0:
+                s_re = now_ts + 5 * 3600                          # estima o próximo reset (5h)
+                s_reset = f"≈ {_fmt_epoch(s_re)}"
+        if w_pct is not None and w_re is None:
+            if p_wre is not None and p_wpct is not None and round(w_pct) == round(p_wpct):
+                w_reset, w_re = p_wr_txt, p_wre
+            elif round(w_pct) == 0:
+                w_re = now_ts + 7 * 86400                         # estima o próximo reset (7d)
+                w_reset = f"≈ {_fmt_epoch(w_re)}"
+
     # Texto de reset presente mas não interpretável => alerta de reset/cap fica mudo.
     # Avisa uma vez por formato para tornar a deriva visível (ex.: novo layout do /usage).
     for txt, epoch in ((s_reset, s_re), (w_reset, w_re)):
@@ -1034,7 +1060,7 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
                   f"desta janela ficam mudos até o formato ser suportado.")
     events = []
     if prev:
-        p_spct, p_sre, p_wpct, p_wre = prev
+        # p_spct/p_sre/p_wpct/p_wre já desempacotados do prev (6 colunas) acima.
         for key, win, sound, pct, p_pct, rep, p_rep, reset_txt in (
             ("5h", "5h", "Ping", s_pct, p_spct, s_re, p_sre, s_reset),
             ("week", "semanal", "Submarine", w_pct, p_wpct, w_re, p_wre, w_reset),
