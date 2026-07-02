@@ -107,6 +107,10 @@ RECONFIRM_COOLDOWN = int(os.environ.get("RECONFIRM_COOLDOWN", "600"))
 # Fallback: quando um reset chega SEM horário e o reconfirm não recupera, estima o próximo reset
 # como now + duração da janela (5h/7d), uma vez, e carrega adiante. METER_INFER_RESET=0 desliga.
 METER_INFER_RESET = os.environ.get("METER_INFER_RESET", "1") not in ("0", "false", "no", "")
+# Warm-up: se o reconfirm re-lê e o /usage segue sem horário, gera um tiquinho de uso (haiku)
+# p/ tirar a janela de 0% e relê — tenta o horário REAL antes de cair na estimativa. Gasta um
+# pouco de cota/centavos; METER_WARMUP=0 desliga (fica só reconfirm + estimativa).
+METER_WARMUP = os.environ.get("METER_WARMUP", "1") not in ("0", "false", "no", "")
 # telegram.env do próprio limit-watch (mesmo arquivo, reaproveitado)
 TG_ENV_FILE = Path(os.environ.get("TG_ENV_FILE", str(Path.home() / ".claude" / "limit-watch" / "telegram.env")))
 
@@ -900,6 +904,23 @@ def _fetch_usage() -> str | None:
     return None
 
 
+def _warmup_usage() -> None:
+    """Gera um tiquinho de uso (prompt trivial no modelo mais barato) para 'destravar' o /usage,
+    que parece omitir a linha 'resets' enquanto a janela está em 0% (ocioso). É o análogo do
+    'forçar um rollout' do Codex, mas gerando atividade — a única alavanca do lado Claude, já
+    que não há arquivo local com o horário. Best-effort e silencioso; a releitura seguinte diz
+    se funcionou. Consome um pouco da cota recém-resetada (por isso é opcional, METER_WARMUP)."""
+    if not shutil.which("claude"):
+        return
+    try:
+        subprocess.run(
+            ["claude", "-p", "responda apenas: ok", "--model", METER_MODEL],
+            capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
 def _parse_line(usage: str, prefix: str) -> tuple[int | None, str | None]:
     # ignora as linhas por-modelo "(... only)": assim o prefixo genérico "Current week"
     # casa a linha agregada mesmo se o /usage relabelar (ex.: "(all Claude models)" ->
@@ -1006,17 +1027,31 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
         last_rc = con.execute("SELECT MAX(ts_epoch) FROM meter WHERE event LIKE '%reconfirm%'").fetchone()[0]
         if last_rc is None or time.time() - last_rc >= RECONFIRM_COOLDOWN:
             did_reconfirm = True
-            usage2 = _fetch_usage()
-            if usage2 is not None:
-                s2p, s2r = _parse_line(usage2, "Current session")
-                w2p, w2r = _parse_line(usage2, "Current week")
-                adopted = False
-                if s_bad and s2p is not None and s2r is not None:  # adota só releitura SAUDÁVEL
-                    s_pct, s_reset = s2p, s2r; adopted = True
-                if w_bad and w2p is not None and w2r is not None:
-                    w_pct, w_reset = w2p, w2r; adopted = True
-                print("🔁 releitura de confirmação do /usage"
-                      + (" — horário de reset recuperado." if adopted else " — ainda sem horário de reset."))
+            def _adopt(u):                       # adota só uma releitura SAUDÁVEL da janela degradada
+                nonlocal s_pct, s_reset, w_pct, w_reset
+                if u is None:
+                    return False
+                s2p, s2r = _parse_line(u, "Current session")
+                w2p, w2r = _parse_line(u, "Current week")
+                a = False
+                if s_bad and _degraded(s_pct, s_reset) and s2p is not None and s2r is not None:
+                    s_pct, s_reset = s2p, s2r; a = True
+                if w_bad and _degraded(w_pct, w_reset) and w2p is not None and w2r is not None:
+                    w_pct, w_reset = w2p, w2r; a = True
+                return a
+            def _still():                        # ainda degradado numa janela que motivou o reconfirm
+                return (s_bad and _degraded(s_pct, s_reset)) or (w_bad and _degraded(w_pct, w_reset))
+            adopted = _adopt(_fetch_usage())
+            # WARM-UP: se a releitura ainda veio sem horário, gera um tiquinho de uso no modelo
+            # mais barato p/ tirar a janela de 0% (o /usage parece omitir o 'resets' com ela em
+            # 0%) e relê UMA vez, buscando o horário REAL antes de cair na estimativa.
+            if METER_WARMUP and _still():
+                print("🔥 warm-up: gerando uso mínimo p/ destravar o horário do /usage...")
+                _warmup_usage()
+                if _adopt(_fetch_usage()):
+                    adopted = True
+            print("🔁 releitura de confirmação do /usage"
+                  + (" — horário de reset recuperado." if adopted else " — ainda sem horário de reset."))
 
     # /usage passou no aceite mas NENHUM percentual parseou (5h e semanal): não grava linha
     # all-NULL. Ela poluiria o histórico (as subqueries <100/>=100 tratam NULL como não

@@ -112,8 +112,13 @@ class ResetClassificationTest(unittest.TestCase):
         self.now = _dt.datetime.now(_dt.timezone.utc).timestamp()
         self.s_re = tm._reset_to_epoch(S_RESET)   # horário NOVO (futuro, ~2 dias)
         self.w_re = tm._reset_to_epoch(W_RESET)
+        # desliga o warm-up por padrão nos testes (senão faria um `claude -p` real); o teste
+        # dedicado do warm-up religa localmente e mocka _warmup_usage.
+        self._orig_warmup = tm.METER_WARMUP
+        tm.METER_WARMUP = False
 
     def tearDown(self):
+        tm.METER_WARMUP = self._orig_warmup
         self.con.close()
 
     def _prev(self, s_pct, s_re):
@@ -233,6 +238,26 @@ class ResetClassificationTest(unittest.TestCase):
                     "SELECT session_reset_epoch FROM meter ORDER BY ts_epoch DESC LIMIT 1").fetchone()[0]
         self.assertEqual(first, second)             # estável, não re-inferido
         self.assertEqual(notify.call_count, n1)     # poll2 não re-alertou
+
+    def test_warmup_recovers_real_reset_time(self):
+        # reconfirm re-lê degradado; o warm-up gera uso e a 3ª leitura traz o horário REAL,
+        # que é adotado em vez da estimativa '≈'.
+        self._prev(99, self.now + 7200)
+        degraded = "Current session: 0% used\n" + self.WEEK_STABLE
+        recovered = f"Current session: 1% used · resets {S_RESET}\n" + self.WEEK_STABLE
+        with patch.object(tm, "METER_WARMUP", True), \
+             patch.object(tm, "_warmup_usage") as warm, \
+             patch.object(tm, "_fetch_usage", side_effect=[degraded, degraded, recovered]), \
+             patch.object(tm, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                tm.meter_once(self.con, notify=False)
+        warm.assert_called_once()                       # gerou o warm-up
+        sr, sre = self.con.execute(
+            "SELECT session_reset, session_reset_epoch FROM meter ORDER BY ts_epoch DESC LIMIT 1"
+        ).fetchone()
+        self.assertFalse(sr.startswith("≈"))            # horário REAL, não estimativa
+        self.assertEqual(sre, self.s_re)                # == _reset_to_epoch(S_RESET)
+        self.assertIn("reset_5h_early", self._event())
 
     def test_reconfirm_recovers_glitch(self):
         # glitch transitório: 1ª leitura 0%+reset None; o reconfirm traz de volta o valor ANTIGO
