@@ -182,19 +182,17 @@ A bridge fica em loop contínuo ouvindo o bot. Cada mensagem recebida dispara
 Você (Telegram) → bot → bridge → claude -p → MCP send_message → você (Telegram)
 ```
 
-### Requisito: permissões do Claude Code
+### Segurança (fail-closed)
 
-A bridge spawna `claude -p --dangerously-skip-permissions` para que Claude execute as MCP tools automaticamente, sem parar para pedir confirmação. Isso é necessário para o loop funcionar sem interação humana.
+A bridge roda o `claude -p` com **allowlist de tools** (`--allowedTools` só com `send_message`/`send_token_report`): as duas tools do Telegram executam sem confirmação e **todo o resto (Bash, Edit, Write, outros MCP servers) é negado**. Além disso:
 
-> **Nota de segurança:** use `--allowed` para restringir quais chat_ids podem controlar a bridge.
+- `--allowed <chat_id>` é **obrigatório** — a bridge não sobe sem a lista de chats autorizados (senão qualquer pessoa que encontrasse o bot comandaria o Claude local).
+- O texto da mensagem entra no prompt **delimitado como dado** (`<user_message>`), com instrução explícita de que ele não muda regras, tools nem o chat de destino (mitiga prompt injection em conteúdo colado/encaminhado).
 
 ### Iniciar a bridge
 
 ```bash
-# Processa mensagens de qualquer chat
-python telegram_bridge.py
-
-# Restringe a chat_ids específicos (recomendado)
+# chat_ids autorizados (obrigatório)
 python telegram_bridge.py --allowed <seu_chat_id>
 
 # Usa modelo mais rápido para respostas mais ágeis
@@ -222,10 +220,10 @@ Relatório de hoje por modelo
 
 | Flag | Padrão | Descrição |
 |---|---|---|
-| `--allowed CHAT_ID ...` | todos | Chat IDs autorizados a interagir com a bridge |
+| `--allowed CHAT_ID ...` | — (obrigatório) | Chat IDs autorizados a interagir com a bridge; sem a lista, a bridge não sobe |
 | `--model MODEL` | config do Claude Code | Modelo usado pelo Claude (ex.: `haiku`, `sonnet`) |
 
-> Internamente, a bridge sempre passa `--dangerously-skip-permissions` ao `claude -p` para evitar prompts de confirmação no loop.
+> Internamente, a bridge passa `--allowedTools` ao `claude -p` com apenas as duas tools do Telegram: elas rodam sem prompt de confirmação e qualquer outra ferramenta (Bash, Edit, MCP externos) é negada no modo não-interativo.
 
 ### Rodar como serviço (launchd no macOS)
 

@@ -27,6 +27,24 @@ mcp = FastMCP("TelegramMCP", log_level="ERROR")
         f"If no chat_id is provided, sends to the default chat ({DEFAULT_CHAT_ID})."
     ),
 )
+def _tg_send(target: str, text: str) -> dict:
+    """Envia com Markdown; se o parse falhar (um '_'/'*'/'`' sem par — comum em nomes
+    snake_case e ids de modelo com '[1m]'), reenvia como texto puro em vez de a resposta
+    sumir em silêncio (o 400 do Telegram só chegava ao modelo, nunca ao usuário)."""
+    response = httpx.post(
+        f"{BASE_URL}/sendMessage",
+        json={"chat_id": target, "text": text, "parse_mode": "Markdown"},
+    )
+    data = response.json()
+    if not data.get("ok") and "parse" in str(data.get("description", "")).lower():
+        response = httpx.post(
+            f"{BASE_URL}/sendMessage",
+            json={"chat_id": target, "text": text},
+        )
+        data = response.json()
+    return data
+
+
 def send_message(
     text: str = Field(description="Message text (supports Markdown)"),
     chat_id: str = Field(default="", description="Telegram chat ID or @username. Uses default if omitted."),
@@ -34,11 +52,7 @@ def send_message(
     target = chat_id or DEFAULT_CHAT_ID
     if not target:
         return "Error: no chat_id provided and TELEGRAM_CHAT_ID is not set in .env"
-    response = httpx.post(
-        f"{BASE_URL}/sendMessage",
-        json={"chat_id": target, "text": text, "parse_mode": "Markdown"},
-    )
-    data = response.json()
+    data = _tg_send(target, text)
     if data.get("ok"):
         msg_id = data["result"]["message_id"]
         return f"Message sent (id={msg_id})"
@@ -132,14 +146,19 @@ def send_token_report(
             cmd += ["--io-only"]
     elif command in ("limits", "meter-report", "codex-meter-report"):
         cmd += ["--limit", str(limit)]
+    elif command == "status":
+        cmd += ["--no-notify"]   # sem popup/Telegram duplicado ao refazer a leitura
 
+    # 170s: 'status' pode refazer o /usage ao vivo (haiku, até ~2min com retries) e
+    # 'report' faz ingest prévio — 60s matava o processo já depois de gastar a sonda.
+    # Fica abaixo dos 180s do claude na bridge para o erro chegar legível ao usuário.
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=170)
         output = (result.stdout or "") + (result.stderr or "")
     except FileNotFoundError:
         return f"Error: token_monitor.py not found at {TOKEN_MONITOR}"
     except subprocess.TimeoutExpired:
-        return "Error: token_monitor.py timed out after 60s"
+        return "Error: token_monitor.py timed out after 170s"
 
     if not output.strip():
         return "Error: token_monitor.py returned no output"
@@ -153,11 +172,7 @@ def send_token_report(
         truncated = output.strip()[: _TELEGRAM_LIMIT - 200]
         text = f"```\n{truncated}\n… (truncado)\n```"
 
-    response = httpx.post(
-        f"{BASE_URL}/sendMessage",
-        json={"chat_id": target, "text": text, "parse_mode": "Markdown"},
-    )
-    data = response.json()
+    data = _tg_send(target, text)
     if data.get("ok"):
         return f"Report sent (id={data['result']['message_id']})"
     return f"Error sending to Telegram: {data.get('description', 'Unknown error')}"

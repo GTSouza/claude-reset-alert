@@ -15,10 +15,13 @@ def _tool_text(result) -> str:
 async def main():
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
 
+    # caminho absoluto: rodar o cliente de fora de cnp/ (ex.: da raiz do repo) não pode
+    # quebrar o spawn do server com "can't open file"
+    server_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "telegram_mcp_server.py")
     command, args = (
-        ("uv", ["run", "telegram_mcp_server.py"])
+        ("uv", ["run", server_path])
         if os.getenv("USE_UV", "0") == "1"
-        else (sys.executable, ["telegram_mcp_server.py"])
+        else (sys.executable, [server_path])
     )
 
     server_params = StdioServerParameters(command=command, args=args)
