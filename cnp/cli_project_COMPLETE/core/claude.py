@@ -34,25 +34,28 @@ class Claude:
         self,
         messages,
         system=None,
-        temperature=1.0,
+        temperature=None,
         stop_sequences=[],
         tools=None,
         thinking=False,
-        thinking_budget=1024,
     ) -> Message:
         params = {
             "model": self.model,
             "max_tokens": 8000,
             "messages": messages,
-            "temperature": temperature,
             "stop_sequences": stop_sequences,
         }
 
+        # temperature só quando pedida explicitamente: os modelos atuais (Opus 4.7+,
+        # Sonnet 5, Fable 5) rejeitam o parâmetro (400) — enviá-la sempre quebrava o
+        # chat inteiro ao trocar o CLAUDE_MODEL para um modelo recente.
+        if temperature is not None:
+            params["temperature"] = temperature
+
+        # forma atual (modelos 4.6+): adaptive. O antigo {"type": "enabled",
+        # "budget_tokens": N} foi removido nos modelos atuais (400 se enviado).
         if thinking:
-            params["thinking"] = {
-                "type": "enabled",
-                "budget_tokens": thinking_budget,
-            }
+            params["thinking"] = {"type": "adaptive"}
 
         if tools:
             params["tools"] = tools

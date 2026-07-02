@@ -95,12 +95,14 @@ class ToolManager:
             except Exception as e:
                 error_message = f"Error executing tool '{tool_name}': {e}"
                 print(error_message)
+                # status fixo "error": referenciar tool_output aqui quebrava de dois
+                # jeitos — UnboundLocalError quando a exceção vem da própria call_tool
+                # (tool_output nunca atribuído, derrubava o CLI inteiro) e "success"
+                # reaproveitado de uma iteração anterior (sinal errado ao modelo).
                 tool_result_part = cls._build_tool_result_part(
                     tool_use_id,
                     json.dumps({"error": error_message}),
-                    "error"
-                    if tool_output and tool_output.isError
-                    else "success",
+                    "error",
                 )
 
             tool_result_blocks.append(tool_result_part)

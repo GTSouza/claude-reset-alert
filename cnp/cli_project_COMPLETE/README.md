@@ -4,7 +4,7 @@ MCP Chat is a command-line interface application that enables interactive chat c
 
 ## Prerequisites
 
-- Python 3.9+
+- Python 3.10+ (o código usa uniões PEP 604 em anotações de runtime e a dependência `mcp` exige >=3.10)
 - Anthropic API Key
 
 ## Setup
@@ -14,7 +14,8 @@ MCP Chat is a command-line interface application that enables interactive chat c
 1. Create or edit the `.env` file in the project root and verify that the following variables are set correctly:
 
 ```
-ANTHROPIC_API_KEY=""  # Enter your Anthropic API secret key
+ANTHROPIC_API_KEY=""              # Enter your Anthropic API secret key
+CLAUDE_MODEL="claude-sonnet-4-6"  # Obrigatório: o app aborta no boot sem um modelo
 ```
 
 ### Step 2: Install dependencies
