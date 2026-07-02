@@ -50,17 +50,13 @@ CREATE TABLE codex_model_usage (
     PRIMARY KEY (rollout, model)
 )
 """
-CREATE_LIMITS = """
-CREATE TABLE limits (uuid TEXT PRIMARY KEY, ts TEXT, ts_epoch REAL, session_id TEXT,
-    project TEXT, model TEXT, message TEXT)
-"""
 
 
 class DashboardTest(unittest.TestCase):
     def setUp(self):
         self.con = sqlite3.connect(":memory:")
         for ddl in (CREATE_METER, CREATE_CODEX_METER, CREATE_USAGE, CREATE_RENEWALS,
-                    CREATE_CODEX_USAGE, CREATE_CODEX_MODEL_USAGE, CREATE_LIMITS):
+                    CREATE_CODEX_USAGE, CREATE_CODEX_MODEL_USAGE):
             self.con.execute(ddl)
         now = time.time()
         # medidor: 90% -> 100% (cap) -> renovação zera; episódio de crédito no meio
@@ -79,9 +75,6 @@ class DashboardTest(unittest.TestCase):
                              (uid, "iso", e, sid, proj, "main", m, i, o, 50_000, 2_000, 0, 0, None, src))
         self.con.execute("INSERT INTO plan_renewals VALUES (?,?,?,?)",
                          (now - 3600, "iso", "max_20x", "renovação"))
-        self.con.execute("INSERT INTO limits VALUES (?,?,?,?,?,?,?)",
-                         ("l1", "2026-07-01T12:00:00Z", now - 86400, "s1-aaaa", "projA",
-                          "<synthetic>", "You've hit your session limit"))
         self.con.execute("INSERT INTO codex_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                          ("r1", "cx1-dddd", now - 4000, now - 3500, "gpt-5", 10, 0, 20, 5, 35, now,
                           "/Users/x/Workspace/outro-app", "Refatora o pipeline"))
@@ -131,14 +124,16 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("Créditos &amp; renovações", html)
         self.assertIn("max_20x", html)
         self.assertIn("💳", html)
-        # seções novas do painel enriquecido
+        # seções do painel enriquecido
         self.assertIn("Medidor Claude semanal", html)
         self.assertIn("Billing — assinatura × créditos", html)
-        self.assertIn("Batidas de limite", html)
-        self.assertIn("hit your session limit", html)
+        self.assertNotIn("Batidas de limite", html)        # seção removida a pedido
         self.assertIn("Preços &amp; calibração", html)
         self.assertIn('class="tot"', html)                 # linha TOTAL por janela
+        self.assertIn("TOTAL — por componente", html)      # card do ~USD do TOTAL
         self.assertIn("🌿", html)                          # branch no card da sessão
+        self.assertIn(">tempo ativo<", html)               # coluna igual à do Codex
+        self.assertIn("custo estimado por modelo", html)   # card do ~USD nos rankings
         # Codex enriquecido: por modelo, top sessões (tooltip com título/cwd) e por dia
         self.assertIn("Codex — por modelo", html)
         self.assertIn("gpt-6", html)

@@ -20,8 +20,8 @@ Uso — tokens & relatórios:
   python3 token_monitor.py bursts --session 86e5a22d  # timeline detalhada (gatilho/billing/cap)
   python3 token_monitor.py watch             # ingest contínuo
   python3 token_monitor.py dashboard --open  # painel HTML autocontido: custos/dia por fonte, modelos
-                                             # (hoje/7d/30d), sessões/projetos c/ tooltips, medidores,
-                                             # billing, créditos, limites, preços e Codex enriquecido
+                                             # (hoje/7d/30d), sessões/projetos c/ tooltips e tempo ativo,
+                                             # medidores, billing, créditos, preços e Codex enriquecido
   python3 token_monitor.py rebuild-usage     # reconstrói a tabela usage com dedup por message.id
 
 Uso — medidor oficial (porte do claude-limit-watch.sh, custo zero) + Codex (rollouts):
@@ -2333,13 +2333,31 @@ def _dash_model_table(mrows: list) -> str:
         for m, i, o, cr, cw, n, usd in mrows) or '<tr><td colspan="9" class="sub">(sem dados)</td></tr>'
     if mrows:
         ti, to = sum(r[1] for r in mrows), sum(r[2] for r in mrows)
+        tusd = sum(r[6] for r in mrows)
+        zero = {"in": 0, "out": 0, "cread": 0, "cwrite": 0}
+        comp = {"in": 0.0, "out": 0.0, "cache leitura": 0.0, "cache escrita": 0.0}
+        for m, i, o, cr, cw, _n, _u in mrows:
+            comp["in"] += cost(m, {**zero, "in": i})
+            comp["out"] += cost(m, {**zero, "out": o})
+            comp["cache leitura"] += cost(m, {**zero, "cread": cr})
+            comp["cache escrita"] += cost(m, {**zero, "cwrite": cw})
+        tot_tip = ('<div class="tt">TOTAL — por componente</div>'
+                   '<div class="ts">soma de todos os modelos, já com o fator calibrado de cada um</div>'
+                   '<table>'
+                   + "".join(f'<tr><td>{lbl}</td><td class="n">US${u:,.2f}</td></tr>'
+                             for lbl, u in comp.items() if u)
+                   + f'<tr><td>total</td><td class="n">US${tusd:,.2f}</td></tr></table>'
+                   '<div class="ts" style="margin-top:6px">por modelo</div><table>'
+                   + "".join(f'<tr><td>{_html.escape(str(m))}</td><td class="n">US${u:,.2f}</td></tr>'
+                             for m, u in sorted(((r[0], r[6]) for r in mrows), key=lambda kv: -kv[1]))
+                   + f'<tr><td>total</td><td class="n">US${tusd:,.2f}</td></tr></table>')
         body += (f'<tr class="tot"><td>TOTAL</td><td class="n">{_dash_fmt(ti)}</td>'
                  f'<td class="n">{_dash_fmt(to)}</td>'
                  f'<td class="n">{round(100 * to / (ti + to)) if (ti + to) else 0}%</td>'
                  f'<td class="n">{_dash_fmt(sum(r[3] for r in mrows))}</td>'
                  f'<td class="n">{_dash_fmt(sum(r[4] for r in mrows))}</td>'
                  f'<td class="n">{_dash_fmt(sum(r[5] for r in mrows))}</td>'
-                 f'<td class="n">US${sum(r[6] for r in mrows):,.2f}</td><td></td></tr>')
+                 f'<td class="n"{_dash_tip_attr(tot_tip)}>US${tusd:,.2f}</td><td></td></tr>')
     return (f'<table><tr><th>modelo</th><th class="n">in</th><th class="n">out</th>'
             f'<th class="n">%out</th><th class="n">cache_r</th><th class="n">cache_w</th>'
             f'<th class="n">msgs</th><th class="n">~USD</th><th></th></tr>{body}</table>')
@@ -2498,6 +2516,14 @@ def dashboard(con: sqlite3.Connection, args) -> None:
                    COUNT(DISTINCT session_id)
             FROM usage WHERE ts_epoch >= ? AND model LIKE 'claude%' GROUP BY {axis}
         """, (since,)).fetchall()}
+        # tempo ativo = Σ (1º->último evento) de cada sessão da chave — igual ao Codex
+        dur = dict(con.execute(f"""
+            SELECT k, SUM(sp) FROM (
+                SELECT {axis} AS k, session_id, MAX(ts_epoch) - MIN(ts_epoch) AS sp
+                FROM usage WHERE ts_epoch >= ? AND model LIKE 'claude%'
+                GROUP BY {axis}, session_id)
+            GROUP BY k
+        """, (since,)).fetchall())
         agg: dict = {}
         for key, m, i, o, cr, cw, n, t0, t1, cred_o in rows:
             a = agg.setdefault(key or "?", {"n": 0, "i": 0, "o": 0, "cr": 0, "cw": 0,
@@ -2515,6 +2541,7 @@ def dashboard(con: sqlite3.Connection, args) -> None:
             a["t0"], a["t1"] = min(a["t0"], t0), max(a["t1"], t1)
         for k, a in agg.items():
             a["branches"], a["projects"], a["nsess"] = meta.get(k, (None, None, 0))
+            a["dur"] = dur.get(k if k != "?" else None) or dur.get(k) or 0
         return sorted(agg.items(), key=lambda kv: -kv[1]["usd"])[:limit]
 
     def span_local(t0: float, t1: float) -> str:
@@ -2530,6 +2557,14 @@ def dashboard(con: sqlite3.Connection, args) -> None:
         tmap = {p.stem: p for p in PROJECTS_DIR.rglob("*.jsonl")}
     except OSError:
         tmap = {}
+    def usd_models_tip(a, header: str) -> str:
+        """Card do ~USD de sessão/projeto: custo por modelo + total."""
+        rows = "".join(f'<tr><td>{_html.escape(str(m))}</td><td class="n">US${u:,.2f}</td></tr>'
+                       for m, u in sorted(a["models"].items(), key=lambda kv: -kv[1]))
+        return (f'<div class="tt">{_html.escape(header)}</div>'
+                f'<div class="ts">custo estimado por modelo (calibrado)</div>'
+                f'<table>{rows}<tr><td>total</td><td class="n">US${a["usd"]:,.2f}</td></tr></table>')
+
     def extra_lines(a) -> str:
         """Linhas comuns dos cards de sessão/projeto: tokens, crédito e branches."""
         s = (f'<div class="ts">🔢 in {_dash_fmt(a["i"])} · out {_dash_fmt(a["o"])} · '
@@ -2545,21 +2580,25 @@ def dashboard(con: sqlite3.Connection, args) -> None:
         p = tmap.get(str(k))
         title = _session_title(p) if p else ""
         wksp = _slug_pretty(p.parent.name) if p else ""
-        proj = _slug_pretty(str(a.get("projects") or ""))
+        pjs = [x for x in str(a.get("projects") or "").split(",") if x]
+        proj = _slug_pretty(pjs[0]) + (f" +{len(pjs) - 1}" if len(pjs) > 1 else "") if pjs else ""
         tip = (f'<div class="tt">{_html.escape(title) or "(sem título)"}</div>'
                + (f'<div class="ts">📁 {_html.escape(wksp)}</div>' if wksp else "")
                + f'<div class="ts">🕒 {span_local(a["t0"], a["t1"])}</div>'
                f'<div class="ts">🤖 {models_html(a["models"])}</div>'
                + extra_lines(a)
+               + (f'<div class="ts">🗂 {_html.escape(", ".join(pjs))}</div>' if len(pjs) > 1 else "")
                + f'<div class="ts">id {_html.escape(str(k))}</div>')
-        sessions.append((str(k)[:8], proj[-28:], a["n"], a["o"], a["usd"], tip))
+        sessions.append((str(k)[:8], proj[-28:], a["n"], a["o"], a["dur"], a["usd"], tip,
+                         usd_models_tip(a, f"sessão {str(k)[:8]}")))
     projects = []
     for k, a in rank_since(now - 7 * 86400, "project"):
         tip = (f'<div class="tt">{_html.escape(str(k))}</div>'
                f'<div class="ts">🕒 {span_local(a["t0"], a["t1"])}</div>'
                f'<div class="ts">🤖 {models_html(a["models"])}</div>'
                + extra_lines(a))
-        projects.append((_slug_pretty(str(k)), a["nsess"], a["n"], a["o"], a["usd"], tip))
+        projects.append((_slug_pretty(str(k)), a["nsess"], a["n"], a["o"], a["dur"], a["usd"], tip,
+                         usd_models_tip(a, _slug_pretty(str(k)))))
 
     # --- créditos: episódios recentes (com custo estimado por modelo) + renovações ---
     ep_rows = []
@@ -2635,28 +2674,20 @@ def dashboard(con: sqlite3.Connection, args) -> None:
 
     # --- billing (hoje e 7 dias): msgs, out e ~USD por fonte de cobrança ---
     def billing_since(since: float) -> dict:
-        agg = {"subscription": [0, 0, 0.0], "credits": [0, 0, 0.0]}   # [msgs, out, usd]
+        agg = {"subscription": [0, 0, 0.0, {}], "credits": [0, 0, 0.0, {}]}  # [msgs, out, usd, {modelo: usd}]
         for src, m, n, o, i, cr, cw in con.execute("""
             SELECT COALESCE(billing_source, 'subscription'), model, COUNT(*),
                    SUM(output_tokens), SUM(input_tokens), SUM(cache_read), SUM(cache_write)
             FROM usage WHERE ts_epoch >= ? AND model LIKE 'claude%' GROUP BY 1, 2
         """, (since,)):
-            slot = agg.setdefault(src, [0, 0, 0.0])
+            slot = agg.setdefault(src, [0, 0, 0.0, {}])
+            usd = cost(m, {"in": i or 0, "out": o or 0, "cread": cr or 0, "cwrite": cw or 0})
             slot[0] += n
             slot[1] += o or 0
-            slot[2] += cost(m, {"in": i or 0, "out": o or 0, "cread": cr or 0, "cwrite": cw or 0})
+            slot[2] += usd
+            slot[3][m] = slot[3].get(m, 0.0) + usd
         return agg
     bill7, bill_today = billing_since(now - 7 * 86400), billing_since(midnight)
-
-    # --- batidas de limite (14 dias), agrupadas por minuto ---
-    try:
-        limit_rows = con.execute("""
-            SELECT substr(ts, 1, 16), MAX(project), MAX(message), COUNT(*)
-            FROM limits WHERE ts_epoch >= ? GROUP BY substr(ts, 1, 16)
-            ORDER BY 1 DESC LIMIT 8
-        """, (now - 14 * 86400,)).fetchall()
-    except sqlite3.OperationalError:
-        limit_rows = []
 
     # --- preços & calibração: o que alimenta o ~USD (modelos vistos em 30d) ---
     seen_models = sorted({m for m, *_ in mwins[2][1]})
@@ -2747,34 +2778,41 @@ def dashboard(con: sqlite3.Connection, args) -> None:
                  f'out(+r) {_dash_fmt(o)}</div>'
                + f'<div class="ts">id {_html.escape(str(sid))}</div>')
         proj_short = wksp.rsplit("/", 1)[-1] if wksp else ""
+        tot_tip = ""
+        if mm:
+            tot_tip = (f'<div class="tt">tokens por modelo</div><table>'
+                       + "".join(f'<tr><td>{_html.escape(str(m))}</td>'
+                                 f'<td class="n">{_dash_fmt(t)}</td></tr>'
+                                 for m, t in sorted(mm.items(), key=lambda kv: -kv[1]))
+                       + f'<tr><td>total</td><td class="n">{_dash_fmt(tot)}</td></tr></table>')
         cxs_rows.append(f'<tr><td{_dash_tip_attr(tip)}>{_html.escape(str(sid)[:8])}</td>'
                         f'<td>{_html.escape(proj_short)}</td>'
                         f'<td class="n">{_dash_fmt(i)}</td><td class="n">{_dash_fmt(o)}</td>'
-                        f'<td class="n">{_dash_fmt(tot)}</td>'
+                        f'<td class="n"{_dash_tip_attr(tot_tip)}>{_dash_fmt(tot)}</td>'
                         f'<td class="n">{_fmt_dur(max((t1 or 0) - (t0 or 0), 0))}</td></tr>')
     codex_sess_table = _dash_table(
         [("sessão", False), ("workspace", False), ("in", True), ("out(+reasoning)", True),
          ("total", True), ("tempo", True)], cxs_rows) if cxs_rows else \
         '<p class="sub">(sem sessões Codex nos últimos 7 dias)</p>'
 
+    def bill_usd_tip(label: str, when: str, usd: float, by_model: dict) -> str:
+        rows = "".join(f'<tr><td>{_html.escape(str(m))}</td><td class="n">US${u:,.2f}</td></tr>'
+                       for m, u in sorted(by_model.items(), key=lambda kv: -kv[1]))
+        return (f'<div class="tt">{label} · {when}</div><table>{rows}'
+                f'<tr><td>total</td><td class="n">US${usd:,.2f}</td></tr></table>')
+
     bill_rows = []
     for src, label in (("subscription", "assinatura"), ("credits", "créditos")):
-        n7, o7, u7 = bill7.get(src, [0, 0, 0.0])
-        nh, oh, uh = bill_today.get(src, [0, 0, 0.0])
+        n7, o7, u7, m7 = bill7.get(src, [0, 0, 0.0, {}])
+        nh, oh, uh, mh = bill_today.get(src, [0, 0, 0.0, {}])
         bill_rows.append(f'<tr><td>{label}</td><td class="n">{_dash_fmt(nh)}</td>'
-                         f'<td class="n">{_dash_fmt(oh)}</td><td class="n">US${uh:,.2f}</td>'
+                         f'<td class="n">{_dash_fmt(oh)}</td>'
+                         f'<td class="n"{_dash_tip_attr(bill_usd_tip(label, "hoje", uh, mh)) if mh else ""}>US${uh:,.2f}</td>'
                          f'<td class="n">{_dash_fmt(n7)}</td><td class="n">{_dash_fmt(o7)}</td>'
-                         f'<td class="n">US${u7:,.2f}</td></tr>')
+                         f'<td class="n"{_dash_tip_attr(bill_usd_tip(label, "7 dias", u7, m7)) if m7 else ""}>US${u7:,.2f}</td></tr>')
     billing_table = _dash_table(
         [("fonte", False), ("msgs hoje", True), ("out hoje", True), ("~USD hoje", True),
          ("msgs 7d", True), ("out 7d", True), ("~USD 7d", True)], bill_rows)
-
-    limit_items = "".join(
-        f'<li>🚧 {ts_min} <span class="sub">· {_html.escape(_slug_pretty(str(proj or "?")))} · '
-        f'{_html.escape(str(msg or ""))[:90]}{" ·" if k > 1 else ""}'
-        f'{f" {k} msgs" if k > 1 else ""}</span></li>'
-        for ts_min, proj, msg, k in limit_rows) or \
-        '<li class="sub">(nenhuma batida de limite em 14 dias)</li>'
 
     price_body = [
         f'<tr><td>{_html.escape(m)}</td><td class="n">US${pi:g}</td><td class="n">US${po:g}</td>'
@@ -2809,17 +2847,21 @@ def dashboard(con: sqlite3.Connection, args) -> None:
 <h2>Custo por modelo <span class="tabs">{mtabs}</span></h2>
 {mpanes}
 <h2>Top sessões — últimos 7 dias</h2>
-{_dash_table([("sessão", False), ("projeto", False), ("msgs", True), ("out", True), ("~USD", True)],
+{_dash_table([("sessão", False), ("projeto", False), ("msgs", True), ("out", True),
+              ("tempo ativo", True), ("~USD", True)],
              [f'<tr><td{_dash_tip_attr(tip_)}>{_html.escape(sid)}</td><td>{_html.escape(pj)}</td>'
               f'<td class="n">{_dash_fmt(n_)}</td><td class="n">{_dash_fmt(o_)}</td>'
-              f'<td class="n">US${u_:,.2f}</td></tr>'
-              for sid, pj, n_, o_, u_, tip_ in sessions])}
+              f'<td class="n">{_fmt_dur(dur_)}</td>'
+              f'<td class="n"{_dash_tip_attr(utip_)}>US${u_:,.2f}</td></tr>'
+              for sid, pj, n_, o_, dur_, u_, tip_, utip_ in sessions])}
 <h2>Por projeto — últimos 7 dias</h2>
-{_dash_table([("projeto", False), ("sessões", True), ("msgs", True), ("out", True), ("~USD", True)],
+{_dash_table([("projeto", False), ("sessões", True), ("msgs", True), ("out", True),
+              ("tempo ativo", True), ("~USD", True)],
              [f'<tr><td{_dash_tip_attr(tip_)}>{_html.escape(pj)}</td><td class="n">{_dash_fmt(ns_)}</td>'
               f'<td class="n">{_dash_fmt(n_)}</td><td class="n">{_dash_fmt(o_)}</td>'
-              f'<td class="n">US${u_:,.2f}</td></tr>'
-              for pj, ns_, n_, o_, u_, tip_ in projects])}
+              f'<td class="n">{_fmt_dur(dur_)}</td>'
+              f'<td class="n"{_dash_tip_attr(utip_)}>US${u_:,.2f}</td></tr>'
+              for pj, ns_, n_, o_, dur_, u_, tip_, utip_ in projects])}
 <h2>Medidor Claude 5h — últimas 24h</h2>
 {_dash_meter_svg(pts)}
 <h2>Medidor Claude semanal — últimos 7 dias</h2>
@@ -2830,8 +2872,6 @@ def dashboard(con: sqlite3.Connection, args) -> None:
 {billing_table}
 <h2>Créditos &amp; renovações</h2>
 <ul class="ev">{ep_items}{renew_items}</ul>
-<h2>Batidas de limite — últimos 14 dias</h2>
-<ul class="ev">{limit_items}</ul>
 <h2>Preços &amp; calibração (base do ~USD)</h2>
 <div class="legend">{calib_note}</div>
 {price_table}
