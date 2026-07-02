@@ -19,6 +19,8 @@ Uso — tokens & relatórios:
   python3 token_monitor.py limits            # episódios de batida de limite
   python3 token_monitor.py bursts --session 86e5a22d  # timeline detalhada (gatilho/billing/cap)
   python3 token_monitor.py watch             # ingest contínuo
+  python3 token_monitor.py dashboard --open  # painel HTML autocontido (status, custos, sessões, eventos)
+  python3 token_monitor.py rebuild-usage     # reconstrói a tabela usage com dedup por message.id
 
 Uso — medidor oficial (porte do claude-limit-watch.sh, custo zero) + Codex (rollouts):
   python3 token_monitor.py meter             # 1 leitura de /usage (grava 5h%/semanal%/eventos)
@@ -38,6 +40,7 @@ Uso — medidor oficial (porte do claude-limit-watch.sh, custo zero) + Codex (ro
 Uso — plano/assinatura e watcher gerenciado:
   python3 token_monitor.py plan --set max_20x --renewed '2026-07-02 12:12'  # registra renovação (fuso METER_TZ)
   python3 token_monitor.py plan               # plano atual + histórico de renovações
+  python3 token_monitor.py plan --remove '2026-07-02 12:12'   # desfaz uma renovação registrada errada
   python3 token_monitor.py agent install      # watcher via launchd (macOS): 1 instância, sobe no login, ressuscita
   python3 token_monitor.py agent status|restart|uninstall
 
@@ -59,8 +62,10 @@ Janelas (--window): 5h | day | week | month
   snapshot do app; (3) o app omite cache. Validação: Sonnet 4.6 bate exato (73.1k in / 6.2M out).
 Custo: base PRICING × fator do modelo (calibrado); ~USD. Modelo sem dado real = fator 1.0.
 Billing: token real enquanto medidor 5h==100% (após cap confirmado) = crédito; senão assinatura.
+  Uma renovação registrada (plan --set) encerra o episódio de crédito na hora da renovação.
 Env úteis: METER_TZ, CREDIT_PCT, RESET_TOLERANCE, DROP_THRESHOLD, FACTORS_PATH, CODEX_SESSIONS_DIR,
-TOKEN_MONITOR_LOCK (lock de instância única dos modos watch), TOKEN_MONITOR_LAUNCHD_LABEL.
+TOKEN_MONITOR_LOCK (lock de instância única dos modos watch), TOKEN_MONITOR_LAUNCHD_LABEL,
+TOKEN_MONITOR_PYTHON (python3 do LaunchAgent), DASHBOARD_PATH (saída do dashboard).
 """
 from __future__ import annotations
 
@@ -2158,6 +2163,20 @@ td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
 .ev { font-size:13px; } .ev li { margin:3px 0; } ul { padding-left:18px; margin:6px 0; }
 svg text { fill:#9aa4af; font-size:10px; }
 footer { margin:30px 0 8px; color:#5f6a76; font-size:11.5px; }
+.tabs { display:inline-flex; gap:6px; margin-left:10px; vertical-align:middle; }
+.tab { background:#171c22; color:#9aa4af; border:1px solid #232a33; border-radius:8px; padding:2px 10px; font:600 12px/1.5 inherit; cursor:pointer; }
+.tab.on { background:#1d4ed8; color:#e8eaed; border-color:#1d4ed8; }
+.legend { font-size:12px; color:#9aa4af; margin:2px 0 6px; }
+[data-tip] { cursor:help; text-decoration:underline dotted #3b5266; text-underline-offset:3px; }
+.tip { position:fixed; display:none; z-index:10; background:#1b222b; border:1px solid #2e3947;
+  border-radius:8px; padding:9px 12px; font-size:12px; max-width:440px; pointer-events:none;
+  box-shadow:0 8px 24px rgba(0,0,0,.55); white-space:normal; }
+.tip .tt { font-weight:700; margin-bottom:3px; }
+.tip .ts { color:#9aa4af; font-size:11.5px; margin:1px 0; }
+.tip table { width:auto; margin-top:5px; font-size:11.5px; }
+.tip th, .tip td { border-bottom:1px solid #232a33; padding:2px 10px 2px 0; }
+.tip tr:last-child td { border-bottom:none; font-weight:700; }
+.sw { display:inline-block; width:10px; height:10px; border-radius:2px; margin:0 4px 0 10px; vertical-align:-1px; }
 """
 
 
@@ -2184,25 +2203,125 @@ def _dash_provider_card(label: str, s_pct, s_reset, w_pct, w_reset) -> str:
 
 
 def _dash_daily_svg(days: list) -> str:
-    """Barras de ~USD/dia (SVG puro). days = [(label, usd)] em ordem cronológica."""
+    """Barras EMPILHADAS de ~USD/dia (SVG puro): assinatura (azul) + crédito (âmbar).
+    days = [(label, usd_assinatura, usd_credito)] em ordem cronológica."""
     if not days:
         return '<p class="sub">(sem dados)</p>'
     W, H, PAD = 940, 150, 26
     n = len(days)
     bw = max(8, (W - PAD) // max(n, 1) - 6)
-    top = max(usd for _, usd in days) or 1.0
+    top = max(s + c for _, s, c in days) or 1.0
     parts = [f'<svg viewBox="0 0 {W} {H + 30}" role="img">']
-    for i, (label, usd) in enumerate(days):
-        h = max(2, round((usd / top) * H))
+    for i, (label, sub_usd, cred_usd) in enumerate(days):
+        total = sub_usd + cred_usd
         x = PAD + i * (bw + 6)
-        y = H - h + 10
-        parts.append(f'<rect x="{x}" y="{y}" width="{bw}" height="{h}" rx="2" fill="#3b82f6">'
-                     f'<title>{label}: US${usd:,.2f}</title></rect>')
+        hs = max(2 if sub_usd or not cred_usd else 0, round((sub_usd / top) * H))
+        hc = max(2 if cred_usd else 0, round((cred_usd / top) * H))
+        ys = H - hs + 10
+        parts.append(f'<rect x="{x}" y="{ys}" width="{bw}" height="{hs}" rx="2" fill="#3b82f6">'
+                     f'<title>{label}: US${total:,.2f} (assinatura US${sub_usd:,.2f})</title></rect>')
+        if hc:
+            parts.append(f'<rect x="{x}" y="{ys - hc}" width="{bw}" height="{hc}" rx="2" fill="#f59e0b">'
+                         f'<title>{label}: crédito US${cred_usd:,.2f}</title></rect>')
         parts.append(f'<text x="{x + bw/2}" y="{H + 22}" text-anchor="middle">{label[5:]}</text>')
-        if usd >= top * 0.25:
-            parts.append(f'<text x="{x + bw/2}" y="{y - 3}" text-anchor="middle">{usd:,.0f}</text>')
+        if total >= top * 0.25:
+            parts.append(f'<text x="{x + bw/2}" y="{ys - hc - 3}" text-anchor="middle">{total:,.0f}</text>')
     parts.append(f'<text x="0" y="14">US$</text></svg>')
     return "".join(parts)
+
+
+def _dash_tip_attr(inner_html: str) -> str:
+    """Atributo data-tip com HTML embutido — o JS do rodapé injeta num card flutuante."""
+    return f' data-tip="{_html.escape(inner_html, quote=True)}"' if inner_html else ""
+
+
+def _dash_usd_tip(m: str, i: int, o: int, cr: int, cw: int, usd: float) -> str:
+    """Card de decomposição do ~USD: o cache (fora das colunas in/out) e o fator
+    calibrado costumam dominar — sem isso a soma parece 'errada' vs o preço do site."""
+    zero = {"in": 0, "out": 0, "cread": 0, "cwrite": 0}
+    price = PRICING.get(_norm_model(m)) or PRICING["_default"]
+    rows = "".join(
+        f'<tr><td>{label}</td><td class="n">{_dash_fmt(v)}</td>'
+        f'<td class="n">US${p:,.2f}/M</td><td class="n">US${cost(m, {**zero, k: v}):,.2f}</td></tr>'
+        for label, k, v, p in (
+            ("in", "in", i, price["in"]), ("out", "out", o, price["out"]),
+            ("cache leitura", "cread", cr, price["cache_read"]),
+            ("cache escrita", "cwrite", cw, price["cache_write"])) if v)
+    factor = FACTORS.get(_norm_model(m), 1.0)
+    note = (f'<div class="ts">custos já com o fator calibrado ×{factor:g} (calibrate)</div>'
+            if factor != 1.0 else "")
+    return (f'<div class="tt">{_html.escape(str(m))}</div>{note}'
+            f'<table><tr><th></th><th class="n">tokens</th><th class="n">preço</th><th class="n">~USD</th></tr>'
+            f'{rows}<tr><td>total</td><td></td><td></td><td class="n">US${usd:,.2f}</td></tr></table>')
+
+
+def _dash_model_table(mrows: list) -> str:
+    """Tabela por modelo. mrows = [(model, in, out, cache_r, cache_w, msgs, usd)]
+    já ordenada por -usd; o ~USD ganha tooltip rico com a decomposição por componente."""
+    mtop = max((r[6] for r in mrows), default=1.0) or 1.0
+    body = "".join(
+        f'<tr><td>{_html.escape(str(m))}</td><td class="n">{_dash_fmt(i)}</td>'
+        f'<td class="n">{_dash_fmt(o)}</td>'
+        f'<td class="n">{round(100 * o / (i + o)) if (i + o) else 0}%</td>'
+        f'<td class="n">{_dash_fmt(cr)}</td><td class="n">{_dash_fmt(cw)}</td>'
+        f'<td class="n">{_dash_fmt(n)}</td>'
+        f'<td class="n"{_dash_tip_attr(_dash_usd_tip(m, i, o, cr, cw, usd))}>US${usd:,.2f}</td>'
+        f'<td><span class="mbar" style="width:{max(2, round(usd / mtop * 160))}px"></span></td></tr>'
+        for m, i, o, cr, cw, n, usd in mrows) or '<tr><td colspan="9" class="sub">(sem dados)</td></tr>'
+    return (f'<table><tr><th>modelo</th><th class="n">in</th><th class="n">out</th>'
+            f'<th class="n">%out</th><th class="n">cache_r</th><th class="n">cache_w</th>'
+            f'<th class="n">msgs</th><th class="n">~USD</th><th></th></tr>{body}</table>')
+
+
+def _dash_rank_table(rows: list, key_th: str) -> str:
+    """Tabela de ranking (sessões/projetos). rows = [(chave, msgs, out, usd)] com um
+    5º item opcional: HTML do tooltip rico (data-tip) da célula da chave."""
+    def tr(r):
+        tip = _dash_tip_attr(str(r[4])) if len(r) > 4 and r[4] else ""
+        return (f'<tr><td{tip}>{_html.escape(str(r[0]))}</td><td class="n">{_dash_fmt(r[1])}</td>'
+                f'<td class="n">{_dash_fmt(r[2])}</td><td class="n">US${r[3]:,.2f}</td></tr>')
+    body = "".join(tr(r) for r in rows) or '<tr><td colspan="4" class="sub">(sem dados)</td></tr>'
+    return (f'<table><tr><th>{key_th}</th><th class="n">msgs</th>'
+            f'<th class="n">out</th><th class="n">~USD</th></tr>{body}</table>')
+
+
+def _slug_pretty(name: str) -> str:
+    """Encurta o slug de diretório de ~/.claude/projects p/ exibição
+    (-Users-fulano-Documents-Workspace-app -> Documents-Workspace-app)."""
+    home_slug = str(Path.home()).replace("/", "-")
+    if name.startswith(home_slug):
+        name = name[len(home_slug):]
+    return name.lstrip("-") or name
+
+
+def _session_title(path: Path, max_lines: int = 400) -> str:
+    """Título da sessão a partir do head do transcript: a linha `summary` (o título
+    que o Claude Code dá à sessão); senão a 1ª mensagem de texto do usuário."""
+    fallback = ""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            for _ in range(max_lines):
+                line = fh.readline(262144)          # linha gigante -> JSON parcial, ignorada
+                if not line:
+                    break
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if obj.get("type") == "summary" and obj.get("summary"):
+                    return str(obj["summary"])[:160]
+                if not fallback and obj.get("type") == "user":
+                    c = (obj.get("message") or {}).get("content")
+                    if isinstance(c, list):
+                        c = next((p.get("text", "") for p in c
+                                  if isinstance(p, dict) and p.get("type") == "text"), "")
+                    if isinstance(c, str):
+                        t = " ".join(c.split())
+                        if t and not t.startswith("<"):   # pula caveats/comandos injetados
+                            fallback = t[:160]
+    except OSError:
+        return ""
+    return fallback
 
 
 def _dash_meter_svg(pts: list) -> str:
@@ -2250,28 +2369,107 @@ def dashboard(con: sqlite3.Connection, args) -> None:
     else:
         verdict, vcls = "GO", "go"
 
-    # --- custo por dia (14 dias, fuso local) ---
+    # --- custo por dia (14 dias, fuso local) quebrado por fonte de cobrança ---
     daily = con.execute("""
         SELECT substr(datetime(ts_epoch + ?, 'unixepoch'), 1, 10) AS d, model,
+               COALESCE(billing_source, 'subscription'),
                SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write)
         FROM usage WHERE ts_epoch >= ? AND model LIKE 'claude%'
-        GROUP BY d, model ORDER BY d
+        GROUP BY d, model, 3 ORDER BY d
     """, (off, now - 14 * 86400)).fetchall()
     per_day: dict = {}
-    for d, m, i, o, cr, cw in daily:
-        per_day[d] = per_day.get(d, 0.0) + cost(m, {"in": i or 0, "out": o or 0, "cread": cr or 0, "cwrite": cw or 0})
-    days = sorted(per_day.items())
+    for d, m, src, i, o, cr, cw in daily:
+        usd = cost(m, {"in": i or 0, "out": o or 0, "cread": cr or 0, "cwrite": cw or 0})
+        slot = per_day.setdefault(d, [0.0, 0.0])          # [assinatura, crédito]
+        slot[1 if src == "credits" else 0] += usd
+    days = [(d, s, c) for d, (s, c) in sorted(per_day.items())]
 
-    # --- custo por modelo (7 dias) ---
-    models = con.execute("""
-        SELECT model, SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write), COUNT(*)
-        FROM usage WHERE ts_epoch >= ? AND model LIKE 'claude%'
-        GROUP BY model
-    """, (now - 7 * 86400,)).fetchall()
-    mrows = sorted(((m, i or 0, o or 0, n,
-                     cost(m, {"in": i or 0, "out": o or 0, "cread": cr or 0, "cwrite": cw or 0}))
-                    for m, i, o, cr, cw, n in models), key=lambda r: -r[4])
-    mtop = max((r[4] for r in mrows), default=1.0) or 1.0
+    # --- custo por modelo (hoje / 7d / 30d — mesmas janelas do report) ---
+    def models_since(since: float) -> list:
+        rows = con.execute("""
+            SELECT model, SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write), COUNT(*)
+            FROM usage WHERE ts_epoch >= ? AND model LIKE 'claude%'
+            GROUP BY model
+        """, (since,)).fetchall()
+        return sorted(((m, i or 0, o or 0, cr or 0, cw or 0, n,
+                        cost(m, {"in": i or 0, "out": o or 0, "cread": cr or 0, "cwrite": cw or 0}))
+                       for m, i, o, cr, cw, n in rows), key=lambda r: -r[6])
+    midnight = datetime.now(_meter_tz()).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    mwins = [("hoje", models_since(midnight)), ("7 dias", models_since(now - 7 * 86400)),
+             ("30 dias", models_since(now - 30 * 86400))]
+
+    # --- top sessões e projetos (7 dias) — os eixos do report --by session/project ---
+    def rank_since(since: float, axis: str, limit: int = 10) -> list:
+        rows = con.execute(f"""
+            SELECT {axis}, model, SUM(input_tokens), SUM(output_tokens),
+                   SUM(cache_read), SUM(cache_write), COUNT(*),
+                   MIN(ts_epoch), MAX(ts_epoch)
+            FROM usage WHERE ts_epoch >= ? AND model LIKE 'claude%'
+            GROUP BY {axis}, model
+        """, (since,)).fetchall()
+        agg: dict = {}
+        for key, m, i, o, cr, cw, n, t0, t1 in rows:
+            a = agg.setdefault(key or "?", {"n": 0, "o": 0, "usd": 0.0,
+                                            "models": {}, "t0": t0, "t1": t1})
+            a["n"] += n
+            a["o"] += o or 0
+            musd = cost(m, {"in": i or 0, "out": o or 0, "cread": cr or 0, "cwrite": cw or 0})
+            a["usd"] += musd
+            a["models"][m] = a["models"].get(m, 0.0) + musd
+            a["t0"], a["t1"] = min(a["t0"], t0), max(a["t1"], t1)
+        return sorted(agg.items(), key=lambda kv: -kv[1]["usd"])[:limit]
+
+    def span_local(t0: float, t1: float) -> str:
+        a = datetime.fromtimestamp(t0, tz=_meter_tz())
+        b = datetime.fromtimestamp(t1, tz=_meter_tz())
+        return f"{a:%d/%m %H:%M} → {b:%d/%m %H:%M}"
+
+    def models_html(models: dict) -> str:
+        ordered = sorted(models.items(), key=lambda kv: -kv[1])
+        return ", ".join(f"{_html.escape(m)} (US${usd:,.0f})" for m, usd in ordered)
+
+    try:                                     # transcript de cada sessão -> título + workspace
+        tmap = {p.stem: p for p in PROJECTS_DIR.rglob("*.jsonl")}
+    except OSError:
+        tmap = {}
+    sessions = []
+    for k, a in rank_since(now - 7 * 86400, "session_id"):
+        p = tmap.get(str(k))
+        title = _session_title(p) if p else ""
+        wksp = _slug_pretty(p.parent.name) if p else ""
+        tip = (f'<div class="tt">{_html.escape(title) or "(sem título)"}</div>'
+               + (f'<div class="ts">📁 {_html.escape(wksp)}</div>' if wksp else "")
+               + f'<div class="ts">🕒 {span_local(a["t0"], a["t1"])}</div>'
+               f'<div class="ts">🤖 {models_html(a["models"])}</div>'
+               f'<div class="ts">id {_html.escape(str(k))}</div>')
+        sessions.append((str(k)[:8], a["n"], a["o"], a["usd"], tip))
+    projects = []
+    for k, a in rank_since(now - 7 * 86400, "project"):
+        tip = (f'<div class="tt">{_html.escape(str(k))}</div>'
+               f'<div class="ts">🕒 {span_local(a["t0"], a["t1"])}</div>'
+               f'<div class="ts">🤖 {models_html(a["models"])}</div>')
+        projects.append((_slug_pretty(str(k)), a["n"], a["o"], a["usd"], tip))
+
+    # --- créditos: episódios recentes + renovações registradas ---
+    episodes = credit_episodes(con)[-5:]
+    ep_rows = [(f"{datetime.fromtimestamp(a, tz=_meter_tz()):%Y-%m-%d %H:%M} → "
+                f"{datetime.fromtimestamp(b, tz=_meter_tz()):%H:%M}",
+                _real_output_tokens(con, a, b)) for a, b in episodes]
+    try:
+        renew_rows = con.execute(
+            "SELECT ts_epoch, plan, note FROM plan_renewals ORDER BY ts_epoch DESC LIMIT 5").fetchall()
+    except sqlite3.OperationalError:
+        renew_rows = []
+
+    # --- Codex por dia (7 dias) — resumo do codex-report ---
+    try:
+        codex_days = con.execute("""
+            SELECT substr(datetime(started_epoch + ?, 'unixepoch'), 1, 10) AS d, COUNT(*),
+                   SUM(output_tokens + COALESCE(reasoning_output_tokens, 0)), SUM(total_tokens)
+            FROM codex_usage WHERE started_epoch >= ? GROUP BY d ORDER BY d DESC
+        """, (off, now - 7 * 86400)).fetchall()
+    except sqlite3.OperationalError:
+        codex_days = []
 
     # --- sparkline do medidor 5h (24h) ---
     pts = con.execute(
@@ -2306,12 +2504,24 @@ def dashboard(con: sqlite3.Connection, args) -> None:
     if not cards:
         cards = '<div class="card"><div class="t">sem leituras — rode: token_monitor.py meter</div></div>'
 
-    mtable = "".join(
-        f'<tr><td>{_html.escape(str(m))}</td><td class="n">{_dash_fmt(i)}</td>'
-        f'<td class="n">{_dash_fmt(o)}</td><td class="n">{_dash_fmt(n)}</td>'
-        f'<td class="n">US${usd:,.2f}</td>'
-        f'<td><span class="mbar" style="width:{max(2, round(usd / mtop * 160))}px"></span></td></tr>'
-        for m, i, o, n, usd in mrows) or '<tr><td colspan="6" class="sub">(sem dados)</td></tr>'
+    mtabs = "".join(f'<button class="tab{" on" if i == 0 else ""}" data-w="mw{i}">{label}</button>'
+                    for i, (label, _) in enumerate(mwins))
+    mpanes = "".join(f'<div id="mw{i}"{"" if i == 0 else " hidden"}>{_dash_model_table(rows)}</div>'
+                     for i, (label, rows) in enumerate(mwins))
+
+    ep_items = "".join(f'<li>💳 {span} <span class="sub">({_dash_fmt(out_tok)} tokens out em crédito)</span></li>'
+                       for span, out_tok in reversed(ep_rows)) or '<li class="sub">(nenhum episódio de crédito)</li>'
+    renew_items = "".join(
+        f'<li>🪪 {datetime.fromtimestamp(e, tz=_meter_tz()):%Y-%m-%d %H:%M} · {_html.escape(p)}'
+        f'{" · " + _html.escape(nt) if nt else ""}</li>'
+        for e, p, nt in renew_rows) or '<li class="sub">(nenhuma renovação registrada — use: plan --set)</li>'
+
+    codex_body = "".join(
+        f'<tr><td>{d}</td><td class="n">{_dash_fmt(n)}</td><td class="n">{_dash_fmt(o)}</td>'
+        f'<td class="n">{_dash_fmt(t)}</td></tr>' for d, n, o, t in codex_days)
+    codex_table = (f'<table><tr><th>dia</th><th class="n">sessões</th><th class="n">out(+reasoning)</th>'
+                   f'<th class="n">total</th></tr>{codex_body}</table>') if codex_body else \
+        '<p class="sub">(sem sessões Codex nos últimos 7 dias)</p>'
 
     sub_out, cred_out = bill.get("subscription", 0) or 0, bill.get("credits", 0) or 0
     ev_items = "".join(
@@ -2328,16 +2538,49 @@ def dashboard(con: sqlite3.Connection, args) -> None:
 <div class="sub">gerado {gen} ({tzname}){plan_chip} · gate 5h&lt;80% · semanal&lt;90% · leituras em cache (sem chamada /usage)</div>
 <div class="cards">{cards}</div>
 <h2>Custo por dia — últimos 14 dias (~USD calibrado)</h2>
+<div class="legend"><span class="sw" style="background:#3b82f6"></span>assinatura<span class="sw" style="background:#f59e0b"></span>crédito</div>
 {_dash_daily_svg(days)}
-<h2>Custo por modelo — últimos 7 dias</h2>
-<table><tr><th>modelo</th><th class="n">in</th><th class="n">out</th><th class="n">msgs</th><th class="n">~USD</th><th></th></tr>{mtable}</table>
+<h2>Custo por modelo <span class="tabs">{mtabs}</span></h2>
+{mpanes}
+<h2>Top sessões — últimos 7 dias</h2>
+{_dash_rank_table(sessions, "sessão")}
+<h2>Por projeto — últimos 7 dias</h2>
+{_dash_rank_table(projects, "projeto")}
 <h2>Medidor 5h — últimas 24h</h2>
 {_dash_meter_svg(pts)}
 <h2>Billing — últimos 7 dias (output tokens)</h2>
 <p>assinatura: <b>{_dash_fmt(sub_out)}</b> · créditos: <b>{_dash_fmt(cred_out)}</b></p>
+<h2>Créditos &amp; renovações</h2>
+<ul class="ev">{ep_items}{renew_items}</ul>
+<h2>Codex — sessões por dia (7 dias)</h2>
+{codex_table}
 <h2>Eventos recentes</h2>
 <ul class="ev">{ev_items}</ul>
 <footer>token_monitor.py dashboard · regenere à vontade (leitura do SQLite, custo zero)</footer>
+<script>
+document.querySelectorAll('.tab').forEach(function (b) {{
+  b.addEventListener('click', function () {{
+    document.querySelectorAll('.tab').forEach(function (x) {{ x.classList.toggle('on', x === b); }});
+    ['mw0', 'mw1', 'mw2'].forEach(function (id) {{
+      document.getElementById(id).hidden = (id !== b.dataset.w);
+    }});
+  }});
+}});
+var tip = document.createElement('div');
+tip.className = 'tip';
+document.body.appendChild(tip);
+document.querySelectorAll('[data-tip]').forEach(function (el) {{
+  el.addEventListener('mouseenter', function () {{
+    tip.innerHTML = el.dataset.tip;
+    tip.style.display = 'block';
+  }});
+  el.addEventListener('mousemove', function (e) {{
+    tip.style.left = Math.max(4, Math.min(e.clientX + 14, innerWidth - tip.offsetWidth - 8)) + 'px';
+    tip.style.top = Math.max(4, Math.min(e.clientY + 16, innerHeight - tip.offsetHeight - 8)) + 'px';
+  }});
+  el.addEventListener('mouseleave', function () {{ tip.style.display = 'none'; }});
+}});
+</script>
 </body></html>"""
 
     out = Path(getattr(args, "out", None) or DASHBOARD_PATH)
