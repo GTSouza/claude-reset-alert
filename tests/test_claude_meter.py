@@ -1,4 +1,5 @@
 import contextlib
+import datetime as _dt
 import io
 import json
 import sqlite3
@@ -7,6 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from cnp import token_monitor as tm
 
@@ -25,8 +27,18 @@ CREATE TABLE meter (
 )
 """
 
-S_RESET = "Jul 3 at 3pm (America/Sao_Paulo)"
-W_RESET = "Jul 6 at 9pm (America/Sao_Paulo)"
+
+def _future_reset(days: int, hour_txt: str, tz: str = "America/Sao_Paulo") -> str:
+    """Texto de reset SEMPRE no futuro (~days à frente), no formato do /usage.
+    Datas fixas ('Jul 3 at 3pm') quebravam todo ano: quando a data literal fica >12h no
+    passado, _reset_to_epoch rola +1 ano e os asserts de delta/fuso explodem — o teste
+    falhava numa janela anual (Jul 3 18:00→Jul 4 06:00 UTC) sem nenhuma mudança de código."""
+    lt = _dt.datetime.now(ZoneInfo(tz)) + _dt.timedelta(days=days)
+    return f"{lt.strftime('%b')} {lt.day} at {hour_txt} ({tz})"
+
+
+S_RESET = _future_reset(2, "3pm")
+W_RESET = _future_reset(5, "9pm")
 
 
 def _usage(s_pct, w_pct):
@@ -259,6 +271,25 @@ class ResetClassificationTest(unittest.TestCase):
         self.assertEqual(sre, self.s_re)                # == _reset_to_epoch(S_RESET)
         self.assertIn("reset_5h_early", self._event())
 
+    def test_estimated_epoch_advance_is_not_reset(self):
+        """Regressão: o horário REAL que chega num poll DEPOIS da estimativa '≈' não pode
+        disparar um 2º 'resetou' (a janela 5h ancora no 1º prompt; o real difere do ≈)."""
+        self._prev(99, self.now + 7200)
+        degraded = "Current session: 0% used\n" + self.WEEK_STABLE
+        healthy = f"Current session: 5% used · resets {S_RESET}\n" + self.WEEK_STABLE
+        # poll 1 gasta 2 fetches (principal + reconfirm, ambos degradados => estimativa ≈)
+        with patch.object(tm, "_fetch_usage", side_effect=[degraded, degraded, healthy]), \
+             patch.object(tm, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                tm.meter_once(self.con, notify=False)     # poll 1: reset antecipado + estimativa ≈
+                n1 = notify.call_count
+                tm.meter_once(self.con, notify=False)     # poll 2: horário REAL >> estimativa, pct=5
+        self.assertEqual(notify.call_count, n1)           # poll 2 NÃO alertou de novo
+        sr, ev = self.con.execute(
+            "SELECT session_reset, event FROM meter ORDER BY ts_epoch DESC LIMIT 1").fetchone()
+        self.assertFalse(sr.startswith("≈"))              # horário real substituiu a estimativa
+        self.assertIsNone(ev)                             # sem evento novo
+
     def test_reconfirm_recovers_glitch(self):
         # glitch transitório: 1ª leitura 0%+reset None; o reconfirm traz de volta o valor ANTIGO
         # (99% + MESMO horário) => adota, NÃO vira reset falso.
@@ -279,18 +310,23 @@ class ResetClassificationTest(unittest.TestCase):
 class ResetToEpochTest(unittest.TestCase):
     """P1/P2: _reset_to_epoch tolera fuso da linha, 24h e forma relativa."""
 
+    # data nominal ÚNICA, ~30 dias no futuro: longe da borda de rolagem de ano nos dois
+    # fusos, então o delta entre eles é o offset puro (sem um lado rolar +1 ano).
+    _base = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=30)
+    DATE = f"{_base.strftime('%b')} {_base.day}"
+
     def test_line_timezone_is_honored(self):
         # mesmo horário nominal, fusos diferentes => epochs diferentes (offset real).
-        sp = tm._reset_to_epoch("Jul 3 at 3pm (America/Sao_Paulo)")   # UTC-3
-        tk = tm._reset_to_epoch("Jul 3 at 3pm (Asia/Tokyo)")          # UTC+9
+        sp = tm._reset_to_epoch(f"{self.DATE} at 3pm (America/Sao_Paulo)")   # UTC-3
+        tk = tm._reset_to_epoch(f"{self.DATE} at 3pm (Asia/Tokyo)")          # UTC+9
         self.assertIsNotNone(sp)
         self.assertIsNotNone(tk)
         self.assertAlmostEqual((sp - tk) / 3600.0, 12.0, places=1)
 
     def test_24h_clock_equals_12h(self):
         self.assertEqual(
-            tm._reset_to_epoch("Jul 3 at 15:00 (America/Sao_Paulo)"),
-            tm._reset_to_epoch("Jul 3 at 3pm (America/Sao_Paulo)"),
+            tm._reset_to_epoch(f"{self.DATE} at 15:00 (America/Sao_Paulo)"),
+            tm._reset_to_epoch(f"{self.DATE} at 3pm (America/Sao_Paulo)"),
         )
 
     def test_relative_form(self):
@@ -302,6 +338,135 @@ class ResetToEpochTest(unittest.TestCase):
 
     def test_unparseable_returns_none(self):
         self.assertIsNone(tm._reset_to_epoch("whenever soon"))
+
+
+class GateTest(unittest.TestCase):
+    """O veredito GO/PAUSE/UNKNOWN consumido pelos runners (exit 0/10/2)."""
+
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        self.con.execute(CREATE_METER)
+        self.now = _dt.datetime.now(_dt.timezone.utc).timestamp()
+
+    def tearDown(self):
+        self.con.close()
+
+    def _args(self, **kw):
+        base = dict(provider="claude", max_5h=80, max_week=90, max_age=300,
+                    refresh=False, no_notify=True, json=False)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def _row(self, s_pct, w_pct, age=10):
+        self.con.execute(
+            "INSERT INTO meter VALUES (?,?,?,?,?,?,?,?,?)",
+            (f"g{age}", self.now - age, s_pct, S_RESET, tm._reset_to_epoch(S_RESET),
+             w_pct, W_RESET, tm._reset_to_epoch(W_RESET), None))
+
+    def _gate(self, args):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return tm.gate(self.con, args)
+
+    def test_go_below_thresholds(self):
+        self._row(20, 30)
+        self.assertEqual(self._gate(self._args()), tm.GATE_GO)
+
+    def test_pause_when_5h_over(self):
+        self._row(95, 30)
+        self.assertEqual(self._gate(self._args()), tm.GATE_PAUSE)
+
+    def test_pause_when_week_over(self):
+        self._row(20, 95)
+        self.assertEqual(self._gate(self._args()), tm.GATE_PAUSE)
+
+    def test_unknown_without_any_reading(self):
+        # banco vazio + releitura falhando => UNKNOWN (exit 2), nunca GO
+        with patch.object(tm, "meter_once", return_value=False):
+            self.assertEqual(self._gate(self._args()), tm.GATE_UNKNOWN)
+
+    def test_both_pauses_when_codex_over(self):
+        self._row(20, 30)                                  # claude ok
+        codex = {"ts_epoch": self.now - 60, "session_pct": 99,
+                 "session_reset_epoch": self.now + 3600,
+                 "week_pct": 50, "week_reset_epoch": self.now + 86400, "plan": "plus"}
+        with patch.object(tm, "read_codex_meter", return_value=codex):
+            self.assertEqual(self._gate(self._args(provider="both")), tm.GATE_PAUSE)
+
+    def test_codex_reading_zeroes_only_after_crossed_reset(self):
+        # reset POSTERIOR ao snapshot e já vencido => janela recuperada (~0%)
+        crossed = {"ts_epoch": self.now - 7200, "session_pct": 95,
+                   "session_reset_epoch": self.now - 3600,   # ts < re <= now
+                   "week_pct": 50, "week_reset_epoch": self.now + 86400, "plan": "plus"}
+        with patch.object(tm, "read_codex_meter", return_value=crossed):
+            rd = tm._codex_reading(self._args(provider="codex"))
+        self.assertEqual(rd["session_pct"], 0.0)
+        # resets_at já vencido NO snapshot (re <= ts) = ruído do CLI, NÃO zera (senão
+        # o gate liberaria GO com uma leitura de 95% ainda válida)
+        stale_re = {"ts_epoch": self.now - 60, "session_pct": 95,
+                    "session_reset_epoch": self.now - 3600,   # re < ts
+                    "week_pct": 50, "week_reset_epoch": self.now + 86400, "plan": "plus"}
+        with patch.object(tm, "read_codex_meter", return_value=stale_re):
+            rd = tm._codex_reading(self._args(provider="codex"))
+        self.assertEqual(rd["session_pct"], 95)
+
+    def test_stale_reading_with_failed_refresh_reports_real_age(self):
+        # releitura falha => a leitura velha NÃO pode virar 'ao vivo'/age=0 (falso GO fresco)
+        self._row(20, 30, age=4000)
+        with patch.object(tm, "meter_once", return_value=False):
+            rd = tm._claude_reading(self.con, self._args())
+        self.assertFalse(rd["refreshed"])
+        self.assertGreaterEqual(rd["age_seconds"], 3999)
+        self.assertIn("cache", rd["source"])
+
+
+class CreditsTest(unittest.TestCase):
+    """credits_started (💳 gasto real além da cota) e credit_episodes/billing."""
+
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        self.con.execute(CREATE_METER)
+        self.con.execute("CREATE TABLE usage (ts_epoch REAL, output_tokens INTEGER, model TEXT)")
+        self.now = _dt.datetime.now(_dt.timezone.utc).timestamp()
+
+    def tearDown(self):
+        self.con.close()
+
+    def _meter_row(self, ts_epoch, pct):
+        self.con.execute(
+            "INSERT INTO meter VALUES (?,?,?,?,?,?,?,?,?)",
+            (f"m{ts_epoch}", ts_epoch, pct, S_RESET, tm._reset_to_epoch(S_RESET),
+             50, W_RESET, tm._reset_to_epoch(W_RESET), None))
+
+    def test_credits_started_fires_once(self):
+        # cap confirmado (90 -> 100) + token real DEPOIS do 1º 100% => 💳 uma vez, sem repetir
+        self._meter_row(self.now - 600, 90)
+        self._meter_row(self.now - 300, 100)
+        self.con.execute("INSERT INTO usage VALUES (?,?,?)", (self.now - 100, 500, "claude-opus-4-8"))
+        usage = f"Current session: 100% used · resets {S_RESET}\nCurrent week (all models): 50% used · resets {W_RESET}"
+        with patch.object(tm, "_fetch_usage", return_value=usage), \
+             patch.object(tm, "ingest"), \
+             patch.object(tm, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                tm.meter_once(self.con, notify=False)
+                ev = self.con.execute("SELECT event FROM meter ORDER BY ts_epoch DESC LIMIT 1").fetchone()[0]
+                tm.meter_once(self.con, notify=False)     # re-poll: NÃO repete
+        self.assertIn("credits_started", ev or "")
+        titles = " ".join(c.args[0] for c in notify.call_args_list)
+        self.assertEqual(titles.count("crédito"), 1)
+
+    def test_credit_episodes_midpoint_and_token_gate(self):
+        # streak 100% com token real => 1 episódio com cap_end no PONTO MÉDIO do gap
+        self._meter_row(1000, 90)
+        self._meter_row(1300, 100)
+        self._meter_row(1600, 100)
+        self._meter_row(1900, 40)
+        self.con.execute("INSERT INTO usage VALUES (?,?,?)", (1500, 100, "claude-opus-4-8"))
+        eps = tm.credit_episodes(self.con)
+        self.assertEqual(len(eps), 1)
+        self.assertEqual(eps[0], (1300, (1600 + 1900) / 2.0))
+        # sem token real no cap => nenhum episódio
+        self.con.execute("DELETE FROM usage")
+        self.assertEqual(tm.credit_episodes(self.con), [])
 
 
 class CalibrateApplyGuardTest(unittest.TestCase):

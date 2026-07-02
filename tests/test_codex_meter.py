@@ -85,6 +85,56 @@ class CodexMeterAlertsTest(unittest.TestCase):
         self.assertIn("reset_5h", event)
 
 
+class CodexCapAndDropTest(unittest.TestCase):
+    """cap_5h (transição <100 -> 100) e o ⚠️ de drop fora do horário — só o Codex os tem
+    nesta forma (o flag usa o ts do SNAPSHOT, não now; código separado do Claude)."""
+
+    def setUp(self):
+        self.con = sqlite3.connect(":memory:")
+        self.con.execute(CREATE_CODEX_METER)
+        # prev: 98% às 1000, resets longe (isola cap/drop do ramo de reset)
+        self.con.execute(
+            "INSERT INTO codex_meter VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("1970-01-01T00:16:40+00:00", 1000, 98, "r", 9000, 50, "w", 90000, "plus", None),
+        )
+
+    def tearDown(self):
+        self.con.close()
+
+    def _snap(self, session_pct):
+        return {"ts_epoch": 2000, "session_pct": session_pct, "session_reset_epoch": 9000,
+                "week_pct": 50, "week_reset_epoch": 90000, "plan": "plus"}
+
+    def test_cap_fires_on_100_transition(self):
+        with patch.object(token_monitor, "read_codex_meter", return_value=self._snap(100)), \
+             patch.object(token_monitor, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                token_monitor.codex_meter_once(self.con, notify=False)
+        ev = self.con.execute("SELECT event FROM codex_meter WHERE ts_epoch=2000").fetchone()[0]
+        self.assertIn("cap_5h", ev or "")
+        self.assertIn("em 100%", notify.call_args.args[0])
+
+    def test_partial_drop_far_from_reset_is_flagged(self):
+        # 98 -> 60 com |ts_snapshot(2000) - p_rep(9000)| = 7000s >= 1800 => drop suspeito ⚠️
+        with patch.object(token_monitor, "read_codex_meter", return_value=self._snap(60)), \
+             patch.object(token_monitor, "_notify") as notify:
+            with contextlib.redirect_stdout(io.StringIO()):
+                token_monitor.codex_meter_once(self.con, notify=False)
+        ev = self.con.execute("SELECT event FROM codex_meter WHERE ts_epoch=2000").fetchone()[0]
+        self.assertIn("drop_5h", ev or "")
+        self.assertIn("⚠️", notify.call_args_list[0].args[0])
+
+    def test_event_survives_idempotent_repoll(self):
+        # o re-poll do MESMO rollout não pode apagar o evento gravado (histórico do report)
+        with patch.object(token_monitor, "read_codex_meter", return_value=self._snap(100)), \
+             patch.object(token_monitor, "_notify"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                token_monitor.codex_meter_once(self.con, notify=False)
+                token_monitor.codex_meter_once(self.con, notify=False)   # re-poll idempotente
+        ev = self.con.execute("SELECT event FROM codex_meter WHERE ts_epoch=2000").fetchone()[0]
+        self.assertIn("cap_5h", ev or "")
+
+
 class CodexWatchTickRefreshTest(unittest.TestCase):
     """O tick do watch confirma ao vivo só quando um reset cruza — e uma vez por snapshot."""
 
