@@ -349,19 +349,32 @@ def ingest(con: sqlite3.Connection, verbose: bool = True) -> tuple[int, int]:
                 continue
             sv = usage.get("server_tool_use") or {}
             t = _usage_tokens(usage)
+            # DEDUP POR MENSAGEM DA API: o Claude Code grava UMA linha .jsonl por bloco de
+            # conteúdo — todas com o MESMO message.id e o MESMO usage (medido: ~65% das
+            # mensagens em 2+ linhas => contar por linha infla tudo ~2-2.9x). A chave de
+            # billing é o message.id (cai no uuid da linha se ausente). Linhas repetidas
+            # colidem na PK; o UPDATE mantém a de MAIOR output (algumas mensagens gravam
+            # (0,0,0,0) primeiro e o valor real depois). Releitura idempotente: usage igual
+            # não é > , então não regrava.
+            key = msg.get("id") or uuid
             row = (
-                uuid, ts, ts_epoch, session_id, project, o.get("gitBranch"),
+                key, ts, ts_epoch, session_id, project, o.get("gitBranch"),
                 model, t["in"], t["out"], t["cr"], t["cw"],
                 int(sv.get("web_search_requests", 0) or 0),
                 int(sv.get("web_fetch_requests", 0) or 0),
                 usage.get("service_tier"),
             )
             cur = con.execute(
-                "INSERT OR IGNORE INTO usage "
+                "INSERT INTO usage "
                 "(uuid, ts, ts_epoch, session_id, project, git_branch, model, "
                 "input_tokens, output_tokens, cache_read, cache_write, "
                 "web_search, web_fetch, service_tier) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(uuid) DO UPDATE SET "
+                "input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, "
+                "cache_read=excluded.cache_read, cache_write=excluded.cache_write, "
+                "web_search=excluded.web_search, web_fetch=excluded.web_fetch "
+                "WHERE excluded.output_tokens > usage.output_tokens", row
             )
             new_usage += max(cur.rowcount, 0)
     con.commit()
@@ -375,6 +388,80 @@ def ingest(con: sqlite3.Connection, verbose: bool = True) -> tuple[int, int]:
         print(f"ingest: +{new_usage} mensagens de uso, +{new_limits} batidas de limite "
               f"| {n_credits} msgs ≈créditos{extra}")
     return new_usage, new_limits
+
+
+def rebuild_usage(con: sqlite3.Connection, args) -> None:
+    """Reconstrói a tabela usage com dedup por message.id — corrige o overcount ~2-2.9x
+    da era em que a chave era o uuid da LINHA (cada mensagem da API aparece em várias
+    linhas do transcript, todas com o mesmo usage).
+
+    1. Backup do banco (token_usage.db.bak-rebuild) antes de tocar em qualquer linha.
+    2. Sessões órfãs (transcript já limpo do disco): dedup por heurística — mesma sessão,
+       mesmo usage (4 campos, não todo-zero) e timestamps a <=10min => mesma mensagem
+       gravada em blocos; mantém a mais antiga.
+    3. Sessões com transcript em disco: apaga as linhas e re-ingere (a chave nova
+       message.id colapsa as duplicatas na fonte).
+    4. Recalcula tokens_json dos episódios de calibração contra os dados deduplicados e
+       re-resolve/aplica os fatores — os antigos (resolvidos contra tokens inflados)
+       subestimariam o custo real daqui em diante. --no-calibrate pula esta etapa.
+    """
+    import shutil as _sh
+    before = con.execute("SELECT COUNT(*), COALESCE(SUM(output_tokens),0) FROM usage").fetchone()
+    bak = str(DB_PATH) + ".bak-rebuild"
+    con.commit()
+    _sh.copyfile(DB_PATH, bak)
+    print(f"backup: {bak}")
+
+    disk_sessions = sorted({p.stem for p in PROJECTS_DIR.rglob("*.jsonl")})
+    con.execute("CREATE TEMP TABLE disk_sess (sid TEXT PRIMARY KEY)")
+    con.executemany("INSERT OR IGNORE INTO disk_sess VALUES (?)", [(s,) for s in disk_sessions])
+
+    # (2) órfãs: dedup heurístico. Restrito a sessões SEM transcript: nas re-ingeríveis a
+    # dedup certa é por message.id (abaixo) — lá, duas mensagens distintas até PODEM ter
+    # usage igual em 10min e não devem ser fundidas.
+    cur = con.execute("""
+        DELETE FROM usage WHERE rowid IN (
+            SELECT a.rowid FROM usage a JOIN usage b
+              ON a.session_id = b.session_id AND a.model IS b.model
+             AND a.input_tokens = b.input_tokens AND a.output_tokens = b.output_tokens
+             AND a.cache_read = b.cache_read AND a.cache_write = b.cache_write
+             AND b.ts_epoch < a.ts_epoch AND a.ts_epoch - b.ts_epoch <= 600
+            WHERE a.session_id NOT IN (SELECT sid FROM disk_sess)
+              AND NOT (a.input_tokens=0 AND a.output_tokens=0 AND a.cache_read=0 AND a.cache_write=0)
+        )""")
+    n_orphan = max(cur.rowcount, 0)
+
+    # (3) re-ingere as sessões em disco do zero
+    cur = con.execute("DELETE FROM usage WHERE session_id IN (SELECT sid FROM disk_sess)")
+    n_disk = max(cur.rowcount, 0)
+    con.execute("DELETE FROM ingest_state WHERE path LIKE ?", (str(PROJECTS_DIR) + "%",))
+    con.commit()
+    print(f"dedup órfãs: -{n_orphan} linhas · re-ingerindo {len(disk_sessions)} sessões ({n_disk} linhas apagadas)...")
+    ingest(con, verbose=False)
+
+    after = con.execute("SELECT COUNT(*), COALESCE(SUM(output_tokens),0) FROM usage").fetchone()
+    print(f"usage: {before[0]:,} -> {after[0]:,} linhas · output {before[1]:,} -> {after[1]:,} "
+          f"({(1 - after[1]/before[1])*100:.1f}% de overcount removido)" if before[1] else "")
+
+    # (4) recalcula os episódios de calibração e re-resolve os fatores
+    if getattr(args, "no_calibrate", False):
+        print("(episódios de calibração NÃO recalculados — rode calibrate --solve --apply depois)")
+        return
+    eps = con.execute("SELECT id, win_from, win_to FROM calibration").fetchall()
+    for eid, wf, wt in eps:
+        try:
+            a = datetime.fromisoformat(wf).timestamp()
+            b = datetime.fromisoformat(wt).timestamp()
+        except Exception:
+            continue
+        con.execute("UPDATE calibration SET tokens_json = ? WHERE id = ?",
+                    (json.dumps(_episode_tokens(con, a, b)), eid))
+    con.commit()
+    if eps:
+        print(f"\n{len(eps)} episódio(s) de calibração recalculado(s); re-resolvendo fatores:")
+        calibrate(con, argparse.Namespace(list=False, solve=True, apply=True,
+                                          usd=None, brl=None, rate=None, note=None,
+                                          from_=None, to=None))
 
 
 # Linha do watch.log: "YYYY-MM-DD HH:MM:SS  📊 5h: N% usado · reset R1  |  semanal: M% usado · reset R2"
@@ -2067,6 +2154,9 @@ def main() -> None:
 
     sub.add_parser("ingest", help="varre os .jsonl e popula o banco")
 
+    rbp = sub.add_parser("rebuild-usage", help="reconstrói a tabela usage com dedup por message.id (corrige overcount)")
+    rbp.add_argument("--no-calibrate", action="store_true", help="não recalcular episódios/fatores de calibração")
+
     rp = sub.add_parser("report", help="relatório agregado", parents=[common])
     rp.add_argument("--window", choices=list(WINDOWS), default="week")
     rp.add_argument("--since", help="data ISO (YYYY-MM-DD); sobrepõe --window")
@@ -2158,7 +2248,9 @@ def main() -> None:
     if wants_ingest and not args.no_ingest:
         ingest(con, verbose=False)
 
-    if args.cmd == "ingest":
+    if args.cmd == "rebuild-usage":
+        rebuild_usage(con, args)
+    elif args.cmd == "ingest":
         ingest(con)
     elif args.cmd == "report":
         report(con, args)

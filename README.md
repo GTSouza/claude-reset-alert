@@ -290,7 +290,8 @@ Use o caminho absoluto do wrapper no `command`. O `SessionStart` mantém o banco
 
 | Comando | Para que serve |
 |---|---|
-| `ingest` | Varre os `.jsonl` + `watch.log` e popula o banco (idempotente, incremental). |
+| `ingest` | Varre os `.jsonl` + `watch.log` e popula o banco (idempotente, incremental). Deduplica por `message.id`: cada mensagem da API aparece em várias linhas do transcript (uma por bloco de conteúdo) com o mesmo `usage` — contar por linha inflaria tudo ~2-3x. |
+| `rebuild-usage` | Reconstrói a tabela `usage` com o dedup por `message.id` (migra um banco da era pré-dedup): faz backup, re-ingere as sessões com transcript em disco, deduplica órfãs por heurística e recalcula/re-aplica a calibração (`--no-calibrate` pula). |
 | `report` | Relatório agregado por janela (`--window 5h/day/week/month`) e eixo (`--by model/session/project/day/billing/none`). `--io-only` mostra só in/out (comparável ao app do Claude). |
 | `limits` | Episódios em que você bateu o limite. |
 | `meter` | Uma leitura do `/usage` do Claude (custo zero) — **e o Codex junto, se houver rollouts** (`--no-codex` desliga); grava na tabela `meter` e alerta reset/queda/cap. `--watch --interval 300` roda em loop (e confirma o Codex ao vivo quando um reset cruza, veja abaixo). |
