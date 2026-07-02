@@ -2070,6 +2070,221 @@ def calibrate(con: sqlite3.Connection, args) -> None:
     print("   rode `calibrate --solve` para recalcular os fatores (e --apply p/ gravar)\n")
 
 
+# --------------------------- Dashboard (HTML) ------------------------------- #
+# HTML AUTOCONTIDO (CSS + SVG inline, zero dependências/JS externo) gerado do SQLite:
+# status ao vivo (Claude + Codex + veredito do gate), custo/dia, custo por modelo,
+# sparkline do medidor 5h, billing assinatura×crédito e eventos recentes.
+DASHBOARD_PATH = Path(os.environ.get("DASHBOARD_PATH", str(Path.home() / ".claude" / "tools" / "dashboard.html")))
+
+_DASH_CSS = """
+:root { color-scheme: dark; }
+body { background:#101418; color:#e8eaed; font:14px/1.5 -apple-system,'Segoe UI',Roboto,sans-serif; margin:24px auto; max-width:980px; padding:0 16px; }
+h1 { font-size:20px; margin:0 0 2px; } h2 { font-size:15px; margin:28px 0 10px; color:#9aa4af; font-weight:600; }
+.sub { color:#9aa4af; font-size:12px; }
+.badge { display:inline-block; padding:2px 12px; border-radius:12px; font-weight:700; font-size:13px; }
+.go { background:#123f24; color:#4ade80; } .pause { background:#42191b; color:#f87171; } .unknown { background:#3a3117; color:#facc15; }
+.cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px; margin-top:14px; }
+.card { background:#171c22; border:1px solid #232a33; border-radius:10px; padding:12px 14px; }
+.card .t { font-size:12px; color:#9aa4af; margin-bottom:6px; }
+.bar { background:#232a33; border-radius:6px; height:10px; overflow:hidden; margin:6px 0 4px; }
+.bar i { display:block; height:100%; border-radius:6px; }
+.g { background:#22c55e; } .y { background:#eab308; } .r { background:#ef4444; }
+.pct { font-size:22px; font-weight:700; } .reset { font-size:11.5px; color:#9aa4af; }
+table { border-collapse:collapse; width:100%; font-size:13px; }
+th { text-align:left; color:#9aa4af; font-weight:600; padding:4px 10px 4px 0; border-bottom:1px solid #232a33; }
+td { padding:4px 10px 4px 0; border-bottom:1px solid #1b2129; white-space:nowrap; }
+td.n, th.n { text-align:right; font-variant-numeric:tabular-nums; }
+.mbar { display:inline-block; height:8px; background:#3b82f6; border-radius:4px; vertical-align:middle; }
+.ev { font-size:13px; } .ev li { margin:3px 0; } ul { padding-left:18px; margin:6px 0; }
+svg text { fill:#9aa4af; font-size:10px; }
+footer { margin:30px 0 8px; color:#5f6a76; font-size:11.5px; }
+"""
+
+
+def _dash_bar_class(pct) -> str:
+    if pct is None:
+        return "y"
+    return "r" if pct >= 80 else ("y" if pct >= 60 else "g")
+
+
+def _dash_fmt(n) -> str:
+    return f"{int(n or 0):,}".replace(",", ".")
+
+
+def _dash_provider_card(label: str, s_pct, s_reset, w_pct, w_reset) -> str:
+    def block(win, pct, reset):
+        p = "?" if pct is None else f"{round(pct)}%"
+        w = 0 if pct is None else min(100, max(2, round(pct)))
+        r = _html.escape(re.sub(r"\s*\([^)]*\)\s*$", "", str(reset or "?")))
+        return (f'<div class="t">{label} · {win}</div><div class="pct">{p}</div>'
+                f'<div class="bar"><i class="{_dash_bar_class(pct)}" style="width:{w}%"></i></div>'
+                f'<div class="reset">reset {r}</div>')
+    return (f'<div class="card">{block("5h", s_pct, s_reset)}</div>'
+            f'<div class="card">{block("semanal", w_pct, w_reset)}</div>')
+
+
+def _dash_daily_svg(days: list) -> str:
+    """Barras de ~USD/dia (SVG puro). days = [(label, usd)] em ordem cronológica."""
+    if not days:
+        return '<p class="sub">(sem dados)</p>'
+    W, H, PAD = 940, 150, 26
+    n = len(days)
+    bw = max(8, (W - PAD) // max(n, 1) - 6)
+    top = max(usd for _, usd in days) or 1.0
+    parts = [f'<svg viewBox="0 0 {W} {H + 30}" role="img">']
+    for i, (label, usd) in enumerate(days):
+        h = max(2, round((usd / top) * H))
+        x = PAD + i * (bw + 6)
+        y = H - h + 10
+        parts.append(f'<rect x="{x}" y="{y}" width="{bw}" height="{h}" rx="2" fill="#3b82f6">'
+                     f'<title>{label}: US${usd:,.2f}</title></rect>')
+        parts.append(f'<text x="{x + bw/2}" y="{H + 22}" text-anchor="middle">{label[5:]}</text>')
+        if usd >= top * 0.25:
+            parts.append(f'<text x="{x + bw/2}" y="{y - 3}" text-anchor="middle">{usd:,.0f}</text>')
+    parts.append(f'<text x="0" y="14">US$</text></svg>')
+    return "".join(parts)
+
+
+def _dash_meter_svg(pts: list) -> str:
+    """Sparkline do medidor 5h nas últimas 24h. pts = [(epoch, pct)]."""
+    if len(pts) < 2:
+        return '<p class="sub">(sem leituras nas últimas 24h)</p>'
+    W, H = 940, 90
+    t0, t1 = pts[0][0], pts[-1][0]
+    span = max(t1 - t0, 1)
+    xy = [(round((t - t0) / span * (W - 10)) + 5, round(H - (p or 0) / 100 * (H - 10)) + 2) for t, p in pts]
+    poly = " ".join(f"{x},{y}" for x, y in xy)
+    return (f'<svg viewBox="0 0 {W} {H + 18}" role="img">'
+            f'<line x1="5" y1="{H - 0.8*(H-10) + 2:.0f}" x2="{W-5}" y2="{H - 0.8*(H-10) + 2:.0f}" stroke="#42191b" stroke-dasharray="4 4"/>'
+            f'<polyline points="{poly}" fill="none" stroke="#22c55e" stroke-width="2"/>'
+            f'<text x="5" y="{H + 14}">-24h</text><text x="{W-40}" y="{H + 14}">agora</text>'
+            f'<text x="{W-70}" y="{H - 0.8*(H-10) - 2:.0f}">80%</text></svg>')
+
+
+def dashboard(con: sqlite3.Connection, args) -> None:
+    """Gera o dashboard HTML a partir do banco (leituras em cache; não chama /usage)."""
+    now = datetime.now(timezone.utc).timestamp()
+    off = _tz_offset_seconds()
+
+    # --- status (última leitura de cada medidor, custo zero) ---
+    row = _latest_meter(con)
+    cl = dict(s_pct=row[1], s_reset=row[2], w_pct=row[3], w_reset=row[4], age=now - row[0]) if row else None
+    cx = read_codex_meter()
+    cx_r = None
+    if cx and cx.get("session_pct") is not None:
+        s_pct, w_pct = cx["session_pct"], cx["week_pct"]
+        # mesma inferência do gate: reset posterior ao snapshot e já vencido => recuperada
+        if cx.get("session_reset_epoch") and cx["ts_epoch"] < cx["session_reset_epoch"] <= now:
+            s_pct = 0.0
+        if cx.get("week_reset_epoch") and cx["ts_epoch"] < cx["week_reset_epoch"] <= now:
+            w_pct = 0.0
+        cx_r = dict(s_pct=s_pct, s_reset=_fmt_epoch(cx.get("session_reset_epoch")),
+                    w_pct=w_pct, w_reset=_fmt_epoch(cx.get("week_reset_epoch")))
+    worst = [p for p in ((cl or {}).get("s_pct"), (cl or {}).get("w_pct"),
+                         (cx_r or {}).get("s_pct"), (cx_r or {}).get("w_pct")) if p is not None]
+    if not worst:
+        verdict, vcls = "UNKNOWN", "unknown"
+    elif ((cl or {}).get("s_pct") or 0) >= 80 or ((cl or {}).get("w_pct") or 0) >= 90 \
+            or ((cx_r or {}).get("s_pct") or 0) >= 80 or ((cx_r or {}).get("w_pct") or 0) >= 90:
+        verdict, vcls = "PAUSE", "pause"
+    else:
+        verdict, vcls = "GO", "go"
+
+    # --- custo por dia (14 dias, fuso local) ---
+    daily = con.execute("""
+        SELECT substr(datetime(ts_epoch + ?, 'unixepoch'), 1, 10) AS d, model,
+               SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write)
+        FROM usage WHERE ts_epoch >= ? AND model LIKE 'claude%'
+        GROUP BY d, model ORDER BY d
+    """, (off, now - 14 * 86400)).fetchall()
+    per_day: dict = {}
+    for d, m, i, o, cr, cw in daily:
+        per_day[d] = per_day.get(d, 0.0) + cost(m, {"in": i or 0, "out": o or 0, "cread": cr or 0, "cwrite": cw or 0})
+    days = sorted(per_day.items())
+
+    # --- custo por modelo (7 dias) ---
+    models = con.execute("""
+        SELECT model, SUM(input_tokens), SUM(output_tokens), SUM(cache_read), SUM(cache_write), COUNT(*)
+        FROM usage WHERE ts_epoch >= ? AND model LIKE 'claude%'
+        GROUP BY model
+    """, (now - 7 * 86400,)).fetchall()
+    mrows = sorted(((m, i or 0, o or 0, n,
+                     cost(m, {"in": i or 0, "out": o or 0, "cread": cr or 0, "cwrite": cw or 0}))
+                    for m, i, o, cr, cw, n in models), key=lambda r: -r[4])
+    mtop = max((r[4] for r in mrows), default=1.0) or 1.0
+
+    # --- sparkline do medidor 5h (24h) ---
+    pts = con.execute(
+        "SELECT ts_epoch, session_pct FROM meter WHERE ts_epoch >= ? AND session_pct IS NOT NULL ORDER BY ts_epoch",
+        (now - 86400,)).fetchall()
+
+    # --- billing (7 dias) ---
+    bill = dict(con.execute(
+        "SELECT COALESCE(billing_source,'subscription'), SUM(output_tokens) FROM usage "
+        "WHERE ts_epoch >= ? AND model LIKE 'claude%' GROUP BY 1", (now - 7 * 86400,)).fetchall())
+
+    # --- eventos recentes (meter + codex_meter) ---
+    evs = con.execute("""
+        SELECT ts, event, 'claude' FROM meter WHERE event IS NOT NULL
+        UNION ALL SELECT ts, event, 'codex' FROM codex_meter WHERE event IS NOT NULL
+        ORDER BY ts DESC LIMIT 14
+    """).fetchall()
+    emoji = {"reset": "🟢", "early": "🟠", "drop": "🔵", "cap": "🔴", "credits": "💳", "reconfirm": "🔁"}
+
+    tzname = METER_TZ
+    gen = datetime.now(_meter_tz()).strftime("%Y-%m-%d %H:%M:%S")
+    cards = ""
+    if cl:
+        cards += _dash_provider_card("Claude", cl["s_pct"], cl["s_reset"], cl["w_pct"], cl["w_reset"])
+    if cx_r:
+        cards += _dash_provider_card("Codex", cx_r["s_pct"], cx_r["s_reset"], cx_r["w_pct"], cx_r["w_reset"])
+    if not cards:
+        cards = '<div class="card"><div class="t">sem leituras — rode: token_monitor.py meter</div></div>'
+
+    mtable = "".join(
+        f'<tr><td>{_html.escape(str(m))}</td><td class="n">{_dash_fmt(i)}</td>'
+        f'<td class="n">{_dash_fmt(o)}</td><td class="n">{_dash_fmt(n)}</td>'
+        f'<td class="n">US${usd:,.2f}</td>'
+        f'<td><span class="mbar" style="width:{max(2, round(usd / mtop * 160))}px"></span></td></tr>'
+        for m, i, o, n, usd in mrows) or '<tr><td colspan="6" class="sub">(sem dados)</td></tr>'
+
+    sub_out, cred_out = bill.get("subscription", 0) or 0, bill.get("credits", 0) or 0
+    ev_items = "".join(
+        f'<li>{next((e for k, e in emoji.items() if k in (ev or "")), "•")} '
+        f'<b>{who}</b> · {_html.escape(ev or "")} <span class="sub">({ts[:16]})</span></li>'
+        for ts, ev, who in evs) or '<li class="sub">(nenhum)</li>'
+
+    html_doc = f"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-reset-alert · dashboard</title>
+<style>{_DASH_CSS}</style></head><body>
+<h1>claude-reset-alert <span class="badge {vcls}">{verdict}</span></h1>
+<div class="sub">gerado {gen} ({tzname}) · gate 5h&lt;80% · semanal&lt;90% · leituras em cache (sem chamada /usage)</div>
+<div class="cards">{cards}</div>
+<h2>Custo por dia — últimos 14 dias (~USD calibrado)</h2>
+{_dash_daily_svg(days)}
+<h2>Custo por modelo — últimos 7 dias</h2>
+<table><tr><th>modelo</th><th class="n">in</th><th class="n">out</th><th class="n">msgs</th><th class="n">~USD</th><th></th></tr>{mtable}</table>
+<h2>Medidor 5h — últimas 24h</h2>
+{_dash_meter_svg(pts)}
+<h2>Billing — últimos 7 dias (output tokens)</h2>
+<p>assinatura: <b>{_dash_fmt(sub_out)}</b> · créditos: <b>{_dash_fmt(cred_out)}</b></p>
+<h2>Eventos recentes</h2>
+<ul class="ev">{ev_items}</ul>
+<footer>token_monitor.py dashboard · regenere à vontade (leitura do SQLite, custo zero)</footer>
+</body></html>"""
+
+    out = Path(getattr(args, "out", None) or DASHBOARD_PATH)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html_doc)
+    print(f"dashboard → {out}")
+    if getattr(args, "open", False):
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        if shutil.which(opener):
+            subprocess.run([opener, str(out)], capture_output=True)
+
+
 # ----------------------------- CLI ----------------------------------------- #
 def _watch_loop(label: str, interval: int, step) -> None:
     print(f"{label} a cada {interval}s (Ctrl-C para sair)")
@@ -2198,6 +2413,10 @@ def main() -> None:
     rbp = sub.add_parser("rebuild-usage", help="reconstrói a tabela usage com dedup por message.id (corrige overcount)")
     rbp.add_argument("--no-calibrate", action="store_true", help="não recalcular episódios/fatores de calibração")
 
+    dbp = sub.add_parser("dashboard", help="gera o dashboard HTML autocontido (status, custo/dia, modelos, medidor, eventos)")
+    dbp.add_argument("--out", default=None, help=f"arquivo de saída (default {DASHBOARD_PATH})")
+    dbp.add_argument("--open", action="store_true", help="abre no navegador após gerar")
+
     rp = sub.add_parser("report", help="relatório agregado", parents=[common])
     rp.add_argument("--window", choices=list(WINDOWS), default="week")
     rp.add_argument("--since", help="data ISO (YYYY-MM-DD); sobrepõe --window")
@@ -2291,6 +2510,8 @@ def main() -> None:
 
     if args.cmd == "rebuild-usage":
         rebuild_usage(con, args)
+    elif args.cmd == "dashboard":
+        dashboard(con, args)
     elif args.cmd == "ingest":
         ingest(con)
     elif args.cmd == "report":

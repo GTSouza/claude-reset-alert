@@ -304,6 +304,7 @@ Use o caminho absoluto do wrapper no `command`. O `SessionStart` mantém o banco
 | **`gate`** | **Veredito GO/PAUSE de rate limit** para runners; `--provider {claude,codex,both}` (default `claude`) — ver abaixo. |
 | `calibrate` | Aprende o fator de custo real por modelo a partir de gastos reais de crédito (`--brl`/`--usd`, `--solve`, `--apply`). |
 | `bursts` | Detalha clusters de atividade (gatilho manual × wakeup × task, billing, modelos, cap). |
+| `dashboard` | Gera um **dashboard HTML autocontido** (CSS+SVG inline, custo zero — só lê o SQLite): status Claude+Codex com veredito do gate, custo/dia (14d, ~USD calibrado), custo por modelo (7d), sparkline do medidor 5h (24h), billing e eventos recentes. `--open` abre no navegador; `--out`/`DASHBOARD_PATH` mudam o destino (default `~/.claude/tools/dashboard.html`). |
 
 > **Billing assinatura × crédito:** o monitor marca como `credits` o uso real produzido **depois** do medidor 5h ser confirmado em 100%, e como `subscription` o resto. Os relatórios `--by billing` e os custos `~USD` (calibrados via `calibrate`) saem desse cruzamento.
 
@@ -326,6 +327,7 @@ Use o caminho absoluto do wrapper no `command`. O `SessionStart` mantém o banco
 | `WATCHLOG_PATH` | `~/.claude/limit-watch/watch.log` | Watch.log importado pelo `ingest` (aponte para o `STATE_DIR` customizado do watcher, se houver). |
 | `FACTORS_PATH` | `~/.claude/tools/pricing_factors.json` | Onde `calibrate --apply` grava os fatores de custo por modelo. |
 | `CODEX_SESSIONS_DIR` | `~/.codex/sessions` | Diretório de rollouts do Codex. |
+| `DASHBOARD_PATH` | `~/.claude/tools/dashboard.html` | Saída padrão do subcomando `dashboard`. |
 
 ### Gate de rate limit (para runners)
 
