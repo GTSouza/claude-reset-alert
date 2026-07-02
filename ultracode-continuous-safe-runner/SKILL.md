@@ -145,6 +145,40 @@ checkpoint:
 - <arquivo ou descrição do estado salvo>
 ```
 
+## Auto-retomada no reset (self-resume) — OBRIGATÓRIO ao pausar
+
+Uma sessão interativa **NÃO volta sozinha**: ela só age quando (a) o usuário manda mensagem ou
+(b) um agendamento dispara nela. Se a pausa só imprime o cabeçalho e para, a sessão fica **ociosa
+até o usuário voltar** — foi exatamente o que aconteceu ("a sessão não resumiu no último pause").
+
+Então, SEMPRE que pausar por `PAUSE` (5h ou semanal), **agende a própria retomada** antes de parar:
+
+1. Pegue o horário de reset do gate (`gate --json` → `session_reset`/`week_reset`; ou o
+   `pause_header`). Calcule os minutos até ~2 min depois do reset (se não der pra parsear com
+   segurança, use `delay_minutes: 60` e re-decida ao acordar).
+2. Agende uma mensagem de retomada **nesta mesma sessão** (preserva o contexto/checkpoint):
+   ```
+   send_later(
+     delay_minutes: <minutos até logo após o reset>,   # ou at: <RFC3339 do reset+2min>
+     message: "Auto-resume: rode `python3 ~/.claude/tools/token_monitor.py gate`. Se GO, retome a
+               fila pendente do checkpoint (<arquivo>) de onde parou. Se ainda PAUSE, reagende o
+               self-resume e pare de novo."
+   )
+   ```
+   Guarde o `trigger_id` retornado no checkpoint.
+3. Informe ao usuário no bloco de pausa: "auto-resume agendado p/ ~<hora> (id `<trigger_id>`)".
+4. Se o usuário retomar **antes** do disparo, cancele o agendamento pendente
+   (`delete_trigger <trigger_id>`) para não haver poke redundante.
+
+Observações:
+- `send_later` é um wrapper de `create_trigger` self-bind + one-shot: dispara UMA vez nesta sessão e
+  se auto-desativa. Ele aparece em `list_triggers` até disparar (por isso `list_triggers` vazio =
+  nada agendado = a sessão nunca ia voltar sozinha).
+- Ambiente **headless/nuvem fresca**: uma sessão nova agendada pode não enxergar o estado LOCAL
+  git-ignorado. Aí prefira o self-bind (fire na MESMA sessão, que mantém o contexto) e não um
+  `create_new_session_on_fire`. Se nem isso for viável no ambiente, diga explicitamente "sem
+  self-resume viável aqui; retomada é manual" em vez de fingir que agendou.
+
 ## Formato de conclusão
 
 ```text
