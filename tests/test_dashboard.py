@@ -39,15 +39,28 @@ CREATE_CODEX_USAGE = """
 CREATE TABLE codex_usage (
     rollout TEXT PRIMARY KEY, session_id TEXT, started_epoch REAL, ended_epoch REAL,
     model TEXT, input_tokens INTEGER, cached_input_tokens INTEGER, output_tokens INTEGER,
-    reasoning_output_tokens INTEGER, total_tokens INTEGER, updated_epoch REAL
+    reasoning_output_tokens INTEGER, total_tokens INTEGER, updated_epoch REAL,
+    cwd TEXT, title TEXT
 )
+"""
+CREATE_CODEX_MODEL_USAGE = """
+CREATE TABLE codex_model_usage (
+    rollout TEXT, model TEXT, input_tokens INTEGER, cached_input_tokens INTEGER,
+    output_tokens INTEGER, reasoning_output_tokens INTEGER, total_tokens INTEGER,
+    PRIMARY KEY (rollout, model)
+)
+"""
+CREATE_LIMITS = """
+CREATE TABLE limits (uuid TEXT PRIMARY KEY, ts TEXT, ts_epoch REAL, session_id TEXT,
+    project TEXT, model TEXT, message TEXT)
 """
 
 
 class DashboardTest(unittest.TestCase):
     def setUp(self):
         self.con = sqlite3.connect(":memory:")
-        for ddl in (CREATE_METER, CREATE_CODEX_METER, CREATE_USAGE, CREATE_RENEWALS, CREATE_CODEX_USAGE):
+        for ddl in (CREATE_METER, CREATE_CODEX_METER, CREATE_USAGE, CREATE_RENEWALS,
+                    CREATE_CODEX_USAGE, CREATE_CODEX_MODEL_USAGE, CREATE_LIMITS):
             self.con.execute(ddl)
         now = time.time()
         # medidor: 90% -> 100% (cap) -> renovação zera; episódio de crédito no meio
@@ -63,11 +76,18 @@ class DashboardTest(unittest.TestCase):
         ]
         for uid, e, sid, proj, m, i, o, src in rows:
             self.con.execute("INSERT INTO usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                             (uid, "iso", e, sid, proj, None, m, i, o, 50_000, 2_000, 0, 0, None, src))
+                             (uid, "iso", e, sid, proj, "main", m, i, o, 50_000, 2_000, 0, 0, None, src))
         self.con.execute("INSERT INTO plan_renewals VALUES (?,?,?,?)",
                          (now - 3600, "iso", "max_20x", "renovação"))
-        self.con.execute("INSERT INTO codex_usage VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                         ("r1", "cx1", now - 4000, now - 3500, "gpt-5", 10, 0, 20, 5, 35, now))
+        self.con.execute("INSERT INTO limits VALUES (?,?,?,?,?,?,?)",
+                         ("l1", "2026-07-01T12:00:00Z", now - 86400, "s1-aaaa", "projA",
+                          "<synthetic>", "You've hit your session limit"))
+        self.con.execute("INSERT INTO codex_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         ("r1", "cx1-dddd", now - 4000, now - 3500, "gpt-5", 10, 0, 20, 5, 35, now,
+                          "/Users/x/Workspace/outro-app", "Refatora o pipeline"))
+        for mdl, i, o, r, t in (("gpt-5", 6, 12, 3, 21), ("gpt-6", 4, 8, 2, 14)):
+            self.con.execute("INSERT INTO codex_model_usage VALUES (?,?,?,?,?,?,?)",
+                             ("r1", mdl, i, 0, o, r, t))
 
     def _render(self) -> str:
         out = Path(self.tmpdir) / "dash.html"
@@ -111,7 +131,20 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("Créditos &amp; renovações", html)
         self.assertIn("max_20x", html)
         self.assertIn("💳", html)
-        # Codex por dia
+        # seções novas do painel enriquecido
+        self.assertIn("Medidor Claude semanal", html)
+        self.assertIn("Billing — assinatura × créditos", html)
+        self.assertIn("Batidas de limite", html)
+        self.assertIn("hit your session limit", html)
+        self.assertIn("Preços &amp; calibração", html)
+        self.assertIn('class="tot"', html)                 # linha TOTAL por janela
+        self.assertIn("🌿", html)                          # branch no card da sessão
+        # Codex enriquecido: por modelo, top sessões (tooltip com título/cwd) e por dia
+        self.assertIn("Codex — por modelo", html)
+        self.assertIn("gpt-6", html)
+        self.assertIn("Codex — top sessões", html)
+        self.assertIn("Refatora o pipeline", html)         # título no data-tip
+        self.assertIn("Workspace/outro-app", html)         # cwd no card
         self.assertIn("Codex — sessões por dia", html)
         self.assertNotIn("sem sessões Codex", html)
 
