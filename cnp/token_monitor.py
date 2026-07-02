@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import html as _html
 import json
 import os
@@ -1183,20 +1184,26 @@ def meter_once(con: sqlite3.Connection, notify: bool = True) -> bool:
     events = []
     if prev:
         # p_spct/p_sre/p_wpct/p_wre já desempacotados do prev (6 colunas) acima.
-        for key, win, sound, pct, p_pct, rep, p_rep, reset_txt in (
-            ("5h", "5h", "Ping", s_pct, p_spct, s_re, p_sre, s_reset),
-            ("week", "semanal", "Submarine", w_pct, p_wpct, w_re, p_wre, w_reset),
+        for key, win, sound, pct, p_pct, rep, p_rep, p_txt, reset_txt in (
+            ("5h", "5h", "Ping", s_pct, p_spct, s_re, p_sre, p_sr_txt, s_reset),
+            ("week", "semanal", "Submarine", w_pct, p_wpct, w_re, p_wre, p_wr_txt, w_reset),
         ):
+            # Horário anterior ESTIMADO ('≈', fallback de inferência) não é referência p/
+            # detectar reset nem classificar antecipado: a janela 5h real ancora no 1º
+            # prompt, então o horário real que chega depois difere da estimativa e o avanço
+            # de epoch dispararia um 2º 'resetou' FALSO no meio da janela (e um 'ANTECIPADO'
+            # falso no reset natural seguinte). Sobre estimativa, só a queda de % decide.
+            est_prev = bool(p_txt) and str(p_txt).startswith("≈")
             # ANTECIPADO (reset anormal): a janela renovou ANTES do horário previsto (p_rep) —
             # a Anthropic zerou a cota fora da janela programada. Natural = no horário ou depois.
             # p_rep None (horário anterior desconhecido) => não dá p/ classificar: trata como
             # natural, sem o marcador de antecipado indevido.
-            early = p_rep is not None and now.timestamp() < p_rep - RESET_TOLERANCE
+            early = p_rep is not None and not est_prev and now.timestamp() < p_rep - RESET_TOLERANCE
             prev_reset_txt = _fmt_epoch(p_rep) if early else None
             ev_reset = f"reset_{key}_early" if early else f"reset_{key}"
             # exige pct conhecido: um avanço de epoch com pct=None (parse falhou) não deve
             # virar 'resetou — 0% usado' e enganar um runner a retomar cedo demais.
-            if pct is not None and rep and p_rep and rep - p_rep > RESET_TOLERANCE:
+            if pct is not None and rep and p_rep and not est_prev and rep - p_rep > RESET_TOLERANCE:
                 # reset com horário NOVO já conhecido (o /usage reporta o próximo reset).
                 events.append(ev_reset)
                 _notify(*_meter_alert("Claude Code", None, "reset", win, pct, reset_txt, early=early, prev_reset=prev_reset_txt), tg=notify)
@@ -1351,8 +1358,16 @@ def read_codex_meter(scan_files: int = 40):
     (usuário com muitas sessões novas sem token_count) e devolver None indevidamente."""
     if not CODEX_SESSIONS_DIR.exists():
         return None
+
+    def _mtime(p):
+        # rollout removido/rotacionado entre o glob e o stat (race com ~/.codex ativo)
+        # não pode derrubar gate/status/watch com FileNotFoundError.
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
     files = sorted(CODEX_SESSIONS_DIR.glob("*/*/*/rollout-*.jsonl"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)[:scan_files]
+                   key=_mtime, reverse=True)[:scan_files]
     best = None
     for fp in files:
         try:
@@ -1529,32 +1544,43 @@ def codex_meter_once(con: sqlite3.Connection, notify: bool = True, as_json: bool
         (ts_epoch,),
     ).fetchone()
     events = []
-    if prev:
-        p_spct, p_sre, p_wpct, p_wre = prev
-        for key, lbl, sound, pct, p_pct, rep, p_rep, reset_txt in (
-            ("5h", "5h", "Ping", s_pct, p_spct, s_re, p_sre, s_reset),
-            ("week", "SEMANAL", "Submarine", w_pct, p_wpct, w_re, p_wre, w_reset),
-        ):
-            # O resets_at do Codex é um INSTANTE ABSOLUTO estável dentro da janela (medido
-            # nos rollouts reais: fica fixo enquanto o % sobe e só avança num reset de fato).
-            # Logo o avanço > tolerância JÁ é reset — mesmo com o % igual (janela semanal
-            # re-saturada 100%->100% no reset). A idempotência (não repetir o MESMO reset em
-            # rollouts seguintes) vem do prev por `ts_epoch <= ?`, não de exigir mudança de %.
-            if pct is not None and rep and p_rep and rep - p_rep > RESET_TOLERANCE:
-                events.append(f"reset_{key}")
-                _notify(*_meter_alert("Codex", m.get("plan"), "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
-            elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
-                events.append(f"drop_{key}")
-                # p_rep None = reset anterior desconhecido: não dá para dizer se a queda
-                # coincide com o reset esperado, então NÃO marca como suspeita (⚠️).
-                flagged = p_rep is not None and abs(ts_epoch - p_rep) >= 1800
-                _notify(*_meter_alert("Codex", m.get("plan"), "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct, flagged=flagged), tg=notify)
-        if s_pct is not None and s_pct >= CREDIT_PCT and p_spct is not None and p_spct < CREDIT_PCT:
-            events.append("cap_5h")
-            _notify(*_meter_alert("Codex", m.get("plan"), "cap", "5h", s_pct, s_reset), tg=notify)
+    # com --json o stdout é só o JSON: o '🔔' do _notify (console) vai para o stderr
+    quiet = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+    with quiet:
+        if prev:
+            p_spct, p_sre, p_wpct, p_wre = prev
+            for key, lbl, sound, pct, p_pct, rep, p_rep, reset_txt in (
+                ("5h", "5h", "Ping", s_pct, p_spct, s_re, p_sre, s_reset),
+                ("week", "SEMANAL", "Submarine", w_pct, p_wpct, w_re, p_wre, w_reset),
+            ):
+                # O resets_at do Codex é um INSTANTE ABSOLUTO estável dentro da janela (medido
+                # nos rollouts reais: fica fixo enquanto o % sobe e só avança num reset de fato).
+                # Logo o avanço > tolerância JÁ é reset — mesmo com o % igual (janela semanal
+                # re-saturada 100%->100% no reset). A idempotência (não repetir o MESMO reset em
+                # rollouts seguintes) vem do prev por `ts_epoch <= ?`, não de exigir mudança de %.
+                if pct is not None and rep and p_rep and rep - p_rep > RESET_TOLERANCE:
+                    events.append(f"reset_{key}")
+                    _notify(*_meter_alert("Codex", m.get("plan"), "reset", "5h" if key == "5h" else "semanal", pct, reset_txt), tg=notify)
+                elif pct is not None and p_pct is not None and pct < p_pct - DROP_THRESHOLD:
+                    events.append(f"drop_{key}")
+                    # p_rep None = reset anterior desconhecido: não dá para dizer se a queda
+                    # coincide com o reset esperado, então NÃO marca como suspeita (⚠️).
+                    flagged = p_rep is not None and abs(ts_epoch - p_rep) >= 1800
+                    _notify(*_meter_alert("Codex", m.get("plan"), "drop", "5h" if key == "5h" else "semanal", pct, reset_txt, p_pct, flagged=flagged), tg=notify)
+            if s_pct is not None and s_pct >= CREDIT_PCT and p_spct is not None and p_spct < CREDIT_PCT:
+                events.append("cap_5h")
+                _notify(*_meter_alert("Codex", m.get("plan"), "cap", "5h", s_pct, s_reset), tg=notify)
 
+    # Poll seguinte do MESMO rollout (mesma PK): events sai vazio (idempotência) — mas o
+    # REPLACE cru apagaria o evento detectado no 1º poll e o codex-meter-report perderia o
+    # histórico ~5min depois. COALESCE preserva o evento já gravado na linha.
     con.execute(
-        "INSERT OR REPLACE INTO codex_meter VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO codex_meter VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(ts) DO UPDATE SET "
+        "session_pct=excluded.session_pct, session_reset=excluded.session_reset, "
+        "session_reset_epoch=excluded.session_reset_epoch, week_pct=excluded.week_pct, "
+        "week_reset=excluded.week_reset, week_reset_epoch=excluded.week_reset_epoch, "
+        "plan=excluded.plan, event=COALESCE(excluded.event, codex_meter.event)",
         (ts_iso, ts_epoch, s_pct, s_reset, s_re, w_pct, w_reset, w_re, m.get("plan"), ",".join(events) or None),
     )
     con.commit()
@@ -1625,17 +1651,22 @@ def _claude_reading(con: sqlite3.Connection, args) -> dict:
     stale = row is None or age > args.max_age
     refreshed = False
     if args.refresh or stale:
+        prev_ts = row[0] if row else None
         meter_once(con, notify=not args.no_notify)
         row = _latest_meter(con)
-        age = 0.0 if row else None
-        refreshed = True
+        # Só é "ao vivo" se NASCEU uma linha nova. Se o /usage falhou, meter_once não grava
+        # nada e row é a MESMA linha velha — reportar age=0/"ao vivo" mascararia a staleness
+        # e um runner receberia GO baseado numa janela que pode já estar em 100%.
+        refreshed = bool(row) and row[0] != prev_ts
+        age = (now - row[0]) if row else None
     if not row or row[1] is None or row[3] is None:
         return {"label": "claude", "session_pct": None, "session_reset": None,
                 "week_pct": None, "week_reset": None, "source": "sem leitura", "refreshed": refreshed}
     _, s_pct, s_reset, w_pct, w_reset = row
     src = "ao vivo" if refreshed else (f"cache {int(age)}s" if age is not None else "—")
     return {"label": "claude", "session_pct": s_pct, "session_reset": s_reset,
-            "week_pct": w_pct, "week_reset": w_reset, "source": src, "refreshed": refreshed}
+            "week_pct": w_pct, "week_reset": w_reset, "source": src, "refreshed": refreshed,
+            "age_seconds": int(age) if age is not None else None}
 
 
 def _codex_reading(args) -> dict:
@@ -1671,10 +1702,15 @@ def gate(con: sqlite3.Connection, args) -> int:
     Claude OU Codex estourar. Retorna o exit code."""
     provider = getattr(args, "provider", "claude")
     readings = []
-    if provider in ("claude", "both"):
-        readings.append(_claude_reading(con, args))
-    if provider in ("codex", "both"):
-        readings.append(_codex_reading(args))
+    # Com --json o stdout é CONTRATO (só o JSON): o refresh embutido (meter_once/_notify)
+    # imprime '📊/🔁/🔔...' — desvia essa saída humana p/ stderr, senão `gate --json | jq`
+    # quebra exatamente no caminho documentado p/ automação.
+    quiet = contextlib.redirect_stdout(sys.stderr) if getattr(args, "json", False) else contextlib.nullcontext()
+    with quiet:
+        if provider in ("claude", "both"):
+            readings.append(_claude_reading(con, args))
+        if provider in ("codex", "both"):
+            readings.append(_codex_reading(args))
 
     reasons = []
     any_valid = False
@@ -2008,8 +2044,13 @@ def calibrate(con: sqlite3.Connection, args) -> None:
     if real_usd <= 0:
         print("gasto real deve ser > 0 (--usd/--brl positivos)."); return
     if args.from_ and args.to:
-        a = datetime.fromisoformat(args.from_).replace(tzinfo=timezone.utc).timestamp()
-        b = datetime.fromisoformat(args.to).replace(tzinfo=timezone.utc).timestamp()
+        # replace(tzinfo=utc) SÓ para datetime naive: num ISO com offset ('-03:00') ele
+        # SUBSTITUIRIA o fuso em vez de converter, deslocando a janela do episódio em horas.
+        def _iso_epoch(s):
+            dt = datetime.fromisoformat(s)
+            return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).timestamp()
+        a = _iso_epoch(args.from_)
+        b = _iso_epoch(args.to)
     else:
         eps = credit_episodes(con)
         if not eps:
@@ -2197,7 +2238,7 @@ def main() -> None:
 
     cxr = sub.add_parser("codex-report", help="uso de tokens do Codex por sessão/dia/modelo (rollouts; tokens + tempo, sem custo)")
     cxr.add_argument("--by", choices=["session", "day", "model", "none"], default="session")
-    cxr.add_argument("--window", default="week", help="5h | day | week | month")
+    cxr.add_argument("--window", choices=list(WINDOWS), default="week")
     cxr.add_argument("--since", default="", help="data ISO YYYY-MM-DD (sobrepõe --window)")
 
     stp = sub.add_parser("status", help="resumo de um olhar: Claude + Codex (5h/semanal) + veredito do gate")
@@ -2283,15 +2324,17 @@ def main() -> None:
                         _make_codex_tick(con, notify, auto_refresh=True))
         else:
             if getattr(args, "refresh", False):
+                # com --json o stdout é só o JSON; o progresso humano vai p/ stderr
+                dst = sys.stderr if args.json else sys.stdout
                 m0 = read_codex_meter()
                 need, why = _codex_refresh_needed(m0, getattr(args, "force", False))
                 if need:
-                    print(f"… confirmando ao vivo (codex exec, turno mínimo): {why}")
+                    print(f"… confirmando ao vivo (codex exec, turno mínimo): {why}", file=dst)
                     st, _ = codex_live_refresh()
-                    print(f"  codex exec: {st}")
+                    print(f"  codex exec: {st}", file=dst)
                 else:
                     age = int(datetime.now(timezone.utc).timestamp() - m0["ts_epoch"]) if m0 and m0.get("ts_epoch") else 0
-                    print(f"  leitura ainda válida (rollout {age}s, nenhum reset cruzado desde então) — sem gasto de cota; use --force para forçar")
+                    print(f"  leitura ainda válida (rollout {age}s, nenhum reset cruzado desde então) — sem gasto de cota; use --force para forçar", file=dst)
             codex_meter_once(con, notify=notify, as_json=args.json)
     elif args.cmd == "codex-meter-report":
         codex_meter_report(con, args)
